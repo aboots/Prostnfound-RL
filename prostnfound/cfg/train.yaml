@@ -1,0 +1,56 @@
+model: prostnfound_adapter_medsam_legacy
+model_kw: {}
+
+# loss
+loss: mil_prop_bce_entropy_reg
+outside_prostate_penalty: false
+add_image_clf: true
+image_clf_mode: cspca
+treat_gg1_as_benign: false
+
+# optimizer
+optimizer: adamw
+lr: 1.0e-05
+encoder_lr: 1.0e-05
+warmup_lr: 0.0001
+cnn_lr: 1.0e-05
+warmup_epochs: 0
+wd: 0.0
+epochs: 35
+accumulate_grad_steps: 1
+cutoff_epoch: null
+
+# training
+run_test: false
+test_every_epoch: false
+run_val: false
+project: miccai2024_comparison
+
+seed: 30
+tracked_metric: val/core_auc_high_involvement
+save_checkpoint_wandb: false
+
+# device
+torch_compile: true
+use_amp: true
+device: cuda
+
+# system
+checkpoint_dir: ${getenv:CHECKPOINT}
+model_checkpoint: null
+
+# misc
+debug: false
+save_best_weights: false
+
+evaluator: 
+  log_images: false
+  log_images_every: 100
+  include_patient_metrics: false
+
+wandb_url: null
+
+defaults: 
+  - data: nct2013.yaml
+
+

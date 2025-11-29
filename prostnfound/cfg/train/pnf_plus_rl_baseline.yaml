@@ -1,0 +1,98 @@
+# ProstNFound-RL baseline configuration (single fold, for initial testing)
+# Use this to test the RL implementation before running full k-fold experiments
+#
+# For very quick testing (10 iterations), use debug mode:
+#   python train_rl.py -c cfg/train/pnf_plus_rl_baseline.yaml debug=true
+
+data:
+  fold: 0
+  n_folds: 5
+  test_center: null
+  exclude_benign_cores_from_positive_patients: true
+  involvement_threshold_pct: null
+  undersample_benign_ratio: null
+  cohort_selection_mode: kfold
+  dataset: default
+  batch_size: 4  # Smaller batch for initial testing
+  num_workers: 4
+  train_subsample_seed: 42
+  augmentations: translate
+  image_size: 256
+  first_downsample_size: null
+  mask_size: 64
+  limit_train_data: null  # Set to null - limit causes issues with data splitting
+  mean: [0, 0, 0]
+  std: [1, 1, 1]
+  flip_ud: false
+  frames: first
+  crop_to_prostate: false
+  rf_as_bmode: false
+  include_rf: false
+
+# Model configuration
+model: prostnfound_rl_adapter_medsam_legacy
+model_kw:
+  prompts: [age,psa]
+  use_class_decoder: true
+  # RL-specific parameters
+  num_attention_points: 3
+  policy_type: categorical
+  policy_hidden_dim: 256  # Smaller for testing
+  use_clinical_in_policy: true
+  freeze_prostnfound: false
+  temperature: 1.0
+
+# Loss configuration
+loss: mil_prop_bce_entropy_reg
+outside_prostate_penalty: false
+add_image_clf: true
+image_clf_mode: cspca
+
+# RL-specific training parameters
+use_rl: true
+rl_mode: grpo
+rl_reward_mode: loss_based
+rl_cspca_bonus: 2.0
+rl_normalize_rewards: true
+rl_num_update_epochs: 2  # Fewer for faster testing
+rl_clip_eps: 0.2
+rl_entropy_coef: 0.01
+rl_value_coef: 0.5
+rl_max_grad_norm: 0.5
+rl_gamma: 1.0
+
+name: "prostnfound-rl-baseline"
+
+# Optimizer configuration
+optimizer: adamw
+lr: 1.0e-04  # Higher LR for faster initial testing
+encoder_lr: 0  # Freeze encoder for initial testing
+warmup_lr: 0.0001
+cnn_lr: 0
+warmup_epochs: 0
+wd: 0
+epochs: 3  # Fewer epochs for testing
+accumulate_grad_steps: 1
+cutoff_epoch: null
+
+run_test: false
+test_every_epoch: false
+run_val: true
+
+project: prostnfound_rl_test
+seed: 30
+tracked_metric: val/core_auc_high_involvement
+
+save_checkpoint_wandb: false
+torch_compile: false
+use_amp: true
+device: cuda
+checkpoint_dir: checkpoints_rl
+model_checkpoint: null
+debug: true
+save_best_weights: true
+
+evaluator:
+  log_images: false  # Disable in debug mode to avoid histogram errors with small data
+  log_images_every: 50
+

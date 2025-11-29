@@ -1,0 +1,73 @@
+# @package _global_
+
+data:
+  fold: ${oc.decode:${oc.env:SLURM_ARRAY_TASK_ID,0}}
+  n_folds: 5
+  test_center: null
+  exclude_benign_cores_from_positive_patients: true
+  involvement_threshold_pct: null
+  undersample_benign_ratio: null
+  cohort_selection_mode: kfold
+  dataset: default
+  batch_size: 8
+  num_workers: 8
+  train_subsample_seed: 42
+  augmentations: translate
+  image_size: 256
+  first_downsample_size: null
+  mask_size: 64
+  limit_train_data: null
+  mean: [0, 0, 0]
+  std: [1, 1, 1]
+  flip_ud: false
+  frames: first
+  crop_to_prostate: false
+  rf_as_bmode: false
+  include_rf: false
+
+model: prostnfound_adapter_medsam_legacy
+model_kw:
+  prompts: [psa, age]
+  use_class_decoder: true
+
+loss: mil_prop_bce_entropy_reg
+outside_prostate_penalty: false
+add_image_clf: true
+image_clf_mode: cspca
+add_image_clf_high_vs_low_grade: false
+
+optimizer: adamw
+lr: 1.0e-05
+encoder_lr: 1.0e-05
+warmup_lr: 0.0001
+cnn_lr: 1.0e-05
+warmup_epochs: 0
+wd: 0
+epochs: 35
+accumulate_grad_steps: 1
+cutoff_epoch: null
+
+run_test: false
+test_every_epoch: false
+run_val: true
+
+project: miccai2024_comparison
+seed: 30
+tracked_metric: val/core_auc
+
+save_checkpoint_wandb: false
+torch_compile: true
+use_amp: true
+device: cuda
+checkpoint_dir: ${getenv:CHECKPOINT}
+model_checkpoint: null
+debug: false
+save_best_weights: false
+
+evaluator:
+  log_images: false
+  log_images_every: 100
+
+wandb: 
+  group: 
+    pnf_plus_kfold_train

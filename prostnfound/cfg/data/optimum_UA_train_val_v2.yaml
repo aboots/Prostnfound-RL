@@ -1,0 +1,36 @@
+
+fold: null
+n_folds: 5
+test_center: null
+exclude_benign_cores_from_positive_patients: true
+involvement_threshold_pct: null
+undersample_benign_ratio: null
+cohort_selection_mode: splits_file
+
+dataset: optimum
+
+batch_size: 8
+num_workers: 8
+
+augmentations: translate
+image_size: 256
+first_downsample_size: null
+mask_size: 64
+limit_train_data: null
+train_subsample_seed: 42
+mean:
+- 0
+- 0
+- 0
+std:
+- 1
+- 1
+- 1
+flip_ud: false
+frames: first
+crop_to_prostate: false
+rf_as_bmode: false
+include_rf: false
+
+root_dir: "/home/pwilson/projects/aip-medilab/pwilson/dinov3/data/exactvu_data/OPTIMUM/processed/UA_annotated_needles"
+splits_file: ${root_dir}/splits.json

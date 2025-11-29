@@ -1,0 +1,56 @@
+# @package _global_
+
+data:
+  fold: 0 
+  n_folds: 5
+  test_center: null
+  exclude_benign_cores_from_positive_patients: true
+  involvement_threshold_pct: null
+  undersample_benign_ratio: null
+  cohort_selection_mode: kfold
+  dataset: optimum
+
+  batch_size: 8
+  num_workers: 8
+  train_subsample_seed: 42
+
+  augmentations: translate
+  image_size: 256
+  first_downsample_size: null
+  mask_size: 64
+  limit_train_data: null
+  mean:
+  - 0
+  - 0
+  - 0
+  std:
+  - 1
+  - 1
+  - 1
+  flip_ud: false
+  frames: first
+  crop_to_prostate: false
+  rf_as_bmode: false
+  include_rf: false
+
+  root_dir: "/h/pwilson/projects/medAI/data/OPTIMUM/processed/UA_annotated_needles"
+
+
+model: prostnfound_plus_final
+model_kw: {}
+image_clf_mode: cspca
+add_image_clf: true
+
+# loss
+loss: mil_prop_bce_entropy_reg
+outside_prostate_penalty: false
+
+run_val: true
+
+evaluator: 
+  log_images: true
+
+wandb: 
+  group: pnf_plus_finetune_ua_kfold_v6
+
+cutoff_epoch: 10

@@ -1,0 +1,96 @@
+
+
+model: dinov3_dense_features_with_linear_head
+model_kw: 
+  backbone_cfg: 
+    name: dinov3_ssl_finetune
+    config_path: '/home/pwilson/projects/aip-medilab/pwilson/dinov3/experiments/2025-08-17_17-00-53/config.yaml'
+    checkpoint_path: /home/pwilson/projects/aip-medilab/pwilson/dinov3/experiments/2025-08-17_17-00-53/ckpt/101249
+  freeze_backbone: true
+  # image_size: ${data.image_size}
+
+# model: dinov3_unetr
+# model_kw: 
+#   freeze_backbone: true
+# metamodel:
+#   mask_output_key: pred_masks
+
+# loss
+loss: mil_prop_bce_entropy_reg
+outside_prostate_penalty: false
+add_image_clf: false
+image_clf_mode: cspca
+treat_gg1_as_benign: false
+
+# optimizer
+optimizer: adamw
+scheduler: constant
+lr: 1e-4
+encoder_lr: 1e-4
+warmup_lr: 1e-4
+cnn_lr: 1e-4
+warmup_epochs: 0
+wd: 0.01
+epochs: 35
+accumulate_grad_steps: 1
+cutoff_epoch: null
+
+# training
+run_test: false
+test_every_epoch: false
+run_val: true
+
+seed: 30
+tracked_metric: val/core_auc_high_involvement
+save_checkpoint_wandb: false
+
+# device
+torch_compile: true
+use_amp: true
+device: cuda
+
+# system
+checkpoint_dir: ${getenv:CHECKPOINT}
+model_checkpoint: null
+
+# misc
+debug: false
+save_best_weights: false
+
+wandb: 
+  name: dinov3_ssl_ft
+  project: miccai2024_comparison
+
+evaluator: 
+  log_images: true
+  log_images_every: 10
+  include_patient_metrics: false
+
+data:
+  cohort_selection_mode: splits_file
+  dataset: optimum
+  batch_size: 8
+  num_workers: 8
+  augmentations: "none"
+  image_size: 256
+  first_downsample_size: null
+  mask_size: 16
+  limit_train_data: null
+  train_subsample_seed: 42
+  mean:
+  - 0.485
+  - 0.456
+  - 0.406
+  std:
+  - 0.229
+  - 0.224
+  - 0.225
+  adapter_cfg:
+    image_orientation: probe_bottom
+  frames: first
+  crop_to_prostate: false
+  rf_as_bmode: false
+  include_rf: false
+  root_dir: "/home/pwilson/projects/aip-medilab/pwilson/dinov3/data/exactvu_data/OPTIMUM/processed/UA_annotated_needles"
+  splits_file: ${data.root_dir}/splits.json
+

@@ -1,0 +1,63 @@
+
+defaults: 
+  - _self_
+
+# === Model Settings ===
+model: prostnfound_adapter_medsam_legacy
+model_kw:
+  prompts: [age, psa, psad, pos]
+  use_class_decoder: true
+
+# === Checkpoint & Output ===
+checkpoint: ${oc.env:PNF_PLUS_CHECKPOINT}  # path to .pth file with weights
+output_dir: "???"      # REQUIRED: directory to save outputs
+
+# === Dataset Configuration (copied from train/pnf_plus_kfold.yaml) ===
+data:
+  fold: 0
+  n_folds: 5
+  test_center: null
+  exclude_benign_cores_from_positive_patients: true
+  involvement_threshold_pct: null
+  undersample_benign_ratio: null
+  cohort_selection_mode: kfold
+  dataset: default
+  batch_size: 8
+  num_workers: 8
+  train_subsample_seed: 42
+  augmentations: translate
+  image_size: 256
+  first_downsample_size: null
+  mask_size: 64
+  limit_train_data: null
+  mean: [0, 0, 0]
+  std: [1, 1, 1]
+  flip_ud: false
+  frames: first
+  crop_to_prostate: false
+  rf_as_bmode: false
+  include_rf: false
+
+split: val         # Which split to evaluate on (e.g., val, test)
+
+# === Calibration ===
+calibrate_bias: false
+calibrate_temperature: false
+calibration_mode: null  # Options: "bag", "pixel", null
+
+# === Metrics ===
+include_patient_metrics: false
+
+# === Save Options ===
+save_checkpoint: false
+save_raw_heatmaps: false
+save_rendered_heatmaps: true
+save_visualizations: false
+save_format: png # could be "pdf" for vector graphics
+
+# === Inference & Processing ===
+postprocess: true  # Whether to post-process heatmaps
+device: cuda        # Device to use (e.g., cuda, cpu)
+use_amp: false      # Use automatic mixed precision
+torch_compile: false  # Use torch.compile if supported
+
