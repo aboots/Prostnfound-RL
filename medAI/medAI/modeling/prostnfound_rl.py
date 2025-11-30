@@ -22,6 +22,11 @@ class ProstNFoundRL(nn.Module):
     to identify suspicious regions. These regions are provided as point prompts
     to guide the decoder's attention.
     
+    Key Features:
+    - Prostate mask-aware attention: Policy is penalized for selecting points outside prostate
+    - Attention gating: RL attention map modulates decoder features for stronger focus
+    - Clinical feature integration: Uses clinical data to guide attention
+    
     Args:
         prostnfound_model: Base ProstNFound model
         num_attention_points: Number of attention points to generate (default: 3)
@@ -30,6 +35,9 @@ class ProstNFoundRL(nn.Module):
         use_clinical_in_policy: Whether to use clinical features in policy (default: True)
         freeze_prostnfound: Whether to freeze ProstNFound weights during RL training (default: False)
         temperature: Temperature for sampling (categorical policy only, default: 1.0)
+        prostate_mask_penalty: Penalty for attention points outside prostate (default: 10.0)
+        use_attention_gating: Whether to use RL attention to gate decoder features (default: True)
+        attention_gate_strength: Strength of attention gating (0-1, default: 0.3)
     """
     
     def __init__(
@@ -41,6 +49,9 @@ class ProstNFoundRL(nn.Module):
         use_clinical_in_policy: bool = True,
         freeze_prostnfound: bool = False,
         temperature: float = 1.0,
+        prostate_mask_penalty: float = 10.0,
+        use_attention_gating: bool = True,
+        attention_gate_strength: float = 0.3,
     ):
         super().__init__()
         
@@ -49,6 +60,9 @@ class ProstNFoundRL(nn.Module):
         self.policy_type = policy_type
         self.use_clinical_in_policy = use_clinical_in_policy
         self.freeze_prostnfound = freeze_prostnfound
+        self.prostate_mask_penalty = prostate_mask_penalty
+        self.use_attention_gating = use_attention_gating
+        self.attention_gate_strength = attention_gate_strength
         
         # Freeze ProstNFound if requested
         if freeze_prostnfound:
@@ -69,6 +83,7 @@ class ProstNFoundRL(nn.Module):
                 image_size=256,  # Standard image size
                 use_clinical_features=use_clinical_in_policy,
                 temperature=temperature,
+                prostate_mask_penalty=prostate_mask_penalty,
             )
         elif policy_type == 'gaussian':
             self.policy = RLAttentionPolicyGaussian(
@@ -77,12 +92,24 @@ class ProstNFoundRL(nn.Module):
                 num_attention_points=num_attention_points,
                 image_size=256,
                 use_clinical_features=use_clinical_in_policy,
+                prostate_mask_penalty=prostate_mask_penalty,
             )
         else:
             raise ValueError(f"Unknown policy_type: {policy_type}. Must be 'categorical' or 'gaussian'")
         
+        # Attention gating layer - transforms RL attention map to feature modulation
+        if use_attention_gating:
+            self.attention_gate = nn.Sequential(
+                nn.Conv2d(1, 64, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(64, 1, kernel_size=1),
+                nn.Sigmoid(),
+            )
+        
         logging.info(f"Created ProstNFoundRL with {policy_type} policy, "
-                    f"{num_attention_points} attention points")
+                    f"{num_attention_points} attention points, "
+                    f"prostate_mask_penalty={prostate_mask_penalty}, "
+                    f"attention_gating={use_attention_gating}")
     
     @property
     def prompts(self):
@@ -103,6 +130,7 @@ class ProstNFoundRL(nn.Module):
         output_mode: Optional[str] = None,
         deterministic: bool = False,
         return_rl_info: bool = True,
+        rl_actions: Optional[torch.Tensor] = None,
         **prompts,
     ) -> Dict[str, Any]:
         """
@@ -116,6 +144,7 @@ class ProstNFoundRL(nn.Module):
             output_mode: Output mode ('heatmaps', 'classifier', or 'all')
             deterministic: If True, use deterministic policy; if False, sample
             return_rl_info: If True, return RL-specific information
+            rl_actions: Optional actions to reuse (B, k) or (B, k, 2)
             **prompts: Clinical prompts (age, psa, etc.)
             
         Returns:
@@ -127,6 +156,8 @@ class ProstNFoundRL(nn.Module):
                 - rl_log_probs: Log probabilities of actions (B, k)
                 - rl_attention_map: Raw attention heatmap (B, 1, H, W)
                 - rl_value: State value estimates (B, 1)
+                - rl_outside_prostate_ratio: Fraction of points outside prostate (B,)
+                - rl_actions: Actions used (B, k) or (B, k, 2)
         """
         output_mode = output_mode or self.prostnfound.output_mode
         B, C, H, W = image.shape
@@ -156,18 +187,40 @@ class ProstNFoundRL(nn.Module):
             
             clinical_features = torch.cat(clinical_list, dim=1)  # B x 4
         
-        # Get attention points from policy
+        # Ensure prostate_mask is in correct format (B, 1, H, W) for policy
+        # The policy's _apply_prostate_mask expects this format for F.interpolate
+        policy_prostate_mask = None
+        if prostate_mask is not None:
+            if prostate_mask.ndim == 3:
+                # (B, H, W) -> (B, 1, H, W)
+                policy_prostate_mask = prostate_mask.unsqueeze(1)
+            elif prostate_mask.ndim == 4:
+                # Already (B, C, H, W), ensure C=1
+                if prostate_mask.shape[1] != 1:
+                    # If multiple channels, take first or average
+                    policy_prostate_mask = prostate_mask[:, 0:1, :, :]
+                else:
+                    policy_prostate_mask = prostate_mask
+            else:
+                logging.warning(f"Unexpected prostate_mask shape: {prostate_mask.shape}, expected (B, H, W) or (B, 1, H, W)")
+                policy_prostate_mask = None
+        
+        # Get attention points from policy with prostate mask constraint
         if self.policy_type == 'categorical':
-            rl_coords, rl_log_probs, rl_attention_map, rl_value = self.policy(
+            rl_coords, rl_log_probs, rl_attention_map, rl_value, outside_prostate_ratio, rl_actions_out = self.policy(
                 image_feats,
                 clinical_features=clinical_features,
+                prostate_mask=policy_prostate_mask,
                 deterministic=deterministic,
+                given_actions=rl_actions,
             )
         else:  # gaussian
-            rl_coords, rl_log_probs, rl_value = self.policy(
+            rl_coords, rl_log_probs, rl_value, outside_prostate_ratio, rl_actions_out = self.policy(
                 image_feats,
                 clinical_features=clinical_features,
+                prostate_mask=policy_prostate_mask,
                 deterministic=deterministic,
+                given_actions=rl_actions,
             )
             rl_attention_map = None
         
@@ -296,9 +349,31 @@ class ProstNFoundRL(nn.Module):
                 size=image_feats.shape[-2:],
             )
         
-        # Pass through mask decoder
+        # Step 5: Apply attention gating to image features
+        # This forces the decoder to focus on RL-highlighted regions
+        if self.use_attention_gating and rl_attention_map is not None:
+            # Resize attention map to match feature dimensions
+            attn_map_resized = torch.nn.functional.interpolate(
+                rl_attention_map,
+                size=image_feats.shape[-2:],
+                mode='bilinear',
+                align_corners=False,
+            )
+            
+            # Convert attention logits to gate values [0, 1]
+            # Use sigmoid to get soft gate, then apply strength modulation
+            gate = self.attention_gate(attn_map_resized)  # B x 1 x H x W
+            
+            # Soft gating: (1 - strength) * original + strength * gated
+            # This ensures we don't completely ignore non-attended regions
+            # but give more weight to attended regions
+            gated_feats = image_feats * (1.0 + self.attention_gate_strength * (gate - 0.5))
+        else:
+            gated_feats = image_feats
+        
+        # Pass through mask decoder with gated features
         mask_logits, iou = self.prostnfound.medsam_model.mask_decoder.forward(
-            image_feats,
+            gated_feats,
             pe,
             sparse_embedding,
             dense_embedding,
@@ -314,7 +389,7 @@ class ProstNFoundRL(nn.Module):
         # Class decoder if available
         if self.prostnfound.class_decoder is not None:
             cls_outputs = self.prostnfound.class_decoder.forward(
-                image_feats,
+                gated_feats,  # Use gated features for classifier too
                 pe,
                 sparse_embedding,
                 dense_embedding,
@@ -342,6 +417,8 @@ class ProstNFoundRL(nn.Module):
                 output['rl_log_probs'] = rl_log_probs
                 output['rl_attention_map'] = rl_attention_map
                 output['rl_value'] = rl_value
+                output['rl_outside_prostate_ratio'] = outside_prostate_ratio
+                output['rl_actions'] = rl_actions_out
             else:
                 # Convert to dict if not already
                 output = {
@@ -350,6 +427,8 @@ class ProstNFoundRL(nn.Module):
                     'rl_log_probs': rl_log_probs,
                     'rl_attention_map': rl_attention_map,
                     'rl_value': rl_value,
+                    'rl_outside_prostate_ratio': outside_prostate_ratio,
+                    'rl_actions': rl_actions_out,
                 }
         
         return output
@@ -387,6 +466,9 @@ def create_prostnfound_rl(
     use_clinical_in_policy: bool = True,
     freeze_prostnfound: bool = False,
     temperature: float = 1.0,
+    prostate_mask_penalty: float = 10.0,
+    use_attention_gating: bool = True,
+    attention_gate_strength: float = 0.3,
 ) -> ProstNFoundRL:
     """
     Factory function to create ProstNFoundRL model.
@@ -399,6 +481,9 @@ def create_prostnfound_rl(
         use_clinical_in_policy: Use clinical features in policy
         freeze_prostnfound: Freeze base model weights
         temperature: Sampling temperature
+        prostate_mask_penalty: Penalty for points outside prostate (default: 10.0)
+        use_attention_gating: Whether to use attention gating (default: True)
+        attention_gate_strength: Strength of attention gating (default: 0.3)
         
     Returns:
         ProstNFoundRL model
@@ -411,6 +496,9 @@ def create_prostnfound_rl(
         use_clinical_in_policy=use_clinical_in_policy,
         freeze_prostnfound=freeze_prostnfound,
         temperature=temperature,
+        prostate_mask_penalty=prostate_mask_penalty,
+        use_attention_gating=use_attention_gating,
+        attention_gate_strength=attention_gate_strength,
     )
 
 
@@ -425,6 +513,9 @@ def prostnfound_rl_adapter_medsam(
     use_clinical_in_policy: bool = True,
     freeze_prostnfound: bool = False,
     temperature: float = 1.0,
+    prostate_mask_penalty: float = 10.0,
+    use_attention_gating: bool = True,
+    attention_gate_strength: float = 0.3,
     prostnfound_kw: dict = {},
     **kwargs,
 ):
@@ -443,6 +534,9 @@ def prostnfound_rl_adapter_medsam(
         use_clinical_in_policy: Use clinical features in policy
         freeze_prostnfound: Freeze base ProstNFound weights
         temperature: Sampling temperature for policy
+        prostate_mask_penalty: Penalty for points outside prostate
+        use_attention_gating: Use RL attention to gate decoder features
+        attention_gate_strength: Strength of attention gating (0-1)
         prostnfound_kw: Additional kwargs for ProstNFound
         **kwargs: Additional kwargs
         
@@ -494,6 +588,9 @@ def prostnfound_rl_adapter_medsam(
         use_clinical_in_policy=use_clinical_in_policy,
         freeze_prostnfound=freeze_prostnfound,
         temperature=temperature,
+        prostate_mask_penalty=prostate_mask_penalty,
+        use_attention_gating=use_attention_gating,
+        attention_gate_strength=attention_gate_strength,
     )
     
     return model
@@ -509,6 +606,9 @@ def prostnfound_rl_adapter_medsam_legacy(
     use_clinical_in_policy: bool = True,
     freeze_prostnfound: bool = False,
     temperature: float = 1.0,
+    prostate_mask_penalty: float = 10.0,
+    use_attention_gating: bool = True,
+    attention_gate_strength: float = 0.3,
     upsample: bool = False,
     use_class_decoder: bool = True,
     **kwargs,
@@ -518,6 +618,11 @@ def prostnfound_rl_adapter_medsam_legacy(
     Compatible with existing ProstNFound+ checkpoints.
     
     This follows the same pattern as prostnfound_adapter_medsam_legacy.
+    
+    Key improvements:
+    - prostate_mask_penalty: Penalizes attention outside prostate region
+    - use_attention_gating: Makes decoder focus on RL-prompted regions
+    - attention_gate_strength: Controls how strongly RL attention guides decoder
     """
     from . import sam
     
@@ -536,6 +641,9 @@ def prostnfound_rl_adapter_medsam_legacy(
         use_clinical_in_policy=use_clinical_in_policy,
         freeze_prostnfound=freeze_prostnfound,
         temperature=temperature,
+        prostate_mask_penalty=prostate_mask_penalty,
+        use_attention_gating=use_attention_gating,
+        attention_gate_strength=attention_gate_strength,
         prostnfound_kw={'use_class_decoder': use_class_decoder},
         **kwargs,
     )
