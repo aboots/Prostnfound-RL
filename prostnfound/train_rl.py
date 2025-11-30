@@ -138,7 +138,11 @@ def main(cfg):
     if use_rl and is_rl_model:
         logging.info("Setting up RL training components")
         
-        # Create GRPO algorithm
+        # Number of samples per image for within-image comparison
+        num_samples_per_image = cfg.get('rl_num_samples_per_image', 4)
+        logging.info(f"Using within-image comparison with {num_samples_per_image} samples per image")
+        
+        # Create GRPO algorithm with within-image comparison support
         grpo = GRPO(
             clip_eps=cfg.get('rl_clip_eps', 0.2),
             entropy_coef=cfg.get('rl_entropy_coef', 0.01),
@@ -146,6 +150,7 @@ def main(cfg):
             max_grad_norm=cfg.get('rl_max_grad_norm', 0.5),
             gamma=cfg.get('rl_gamma', 1.0),
             normalize_advantages=cfg.get('rl_normalize_advantages', True),
+            num_samples_per_image=num_samples_per_image,
         )
         
         # Create reward computer
@@ -315,48 +320,94 @@ def run_train_epoch(
 def run_rl_train_epoch(
     args, model, loader, criterion, optimizer, scheduler, scaler, grpo, reward_computer, epoch, desc="Train RL"
 ):
-    """RL training epoch with GRPO"""
+    """
+    RL training epoch with GRPO using Within-Image Comparison.
+    
+    Key improvement: Instead of comparing different images (which have different difficulty),
+    we sample multiple rollouts (attention locations) per image and compare them within
+    each image. This allows the model to learn which attention strategies work better
+    for each specific image.
+    """
     model.train()
     evaluator = Evaluator(**args.evaluator)
+    
+    # Number of samples (rollouts) per image for within-image comparison
+    num_samples_per_image = args.get('rl_num_samples_per_image', 4)
 
     for train_iter, data in enumerate(tqdm(loader, desc=desc)):
 
         if args.debug and train_iter > 10:
             break
 
-        # Step 1: Collect rollout (sample from policy)
+        # Step 1: Collect multiple rollouts per image for within-image comparison
+        # This is the key change: instead of one sample per image, we sample multiple
+        # attention location configurations and compare them within each image
         with torch.no_grad():
-            rollout_data = model(data, deterministic=False)
+            all_rollout_data = []
+            all_rewards = []
             
-            # Store old log probs for GRPO
-            old_log_probs = rollout_data.get('rl_log_probs', None)
-            old_values = rollout_data.get('rl_value', None)
+            for sample_idx in range(num_samples_per_image):
+                # Sample from policy (non-deterministic)
+                rollout_data = model(data, deterministic=False)
+                
+                # Store rollout data
+                all_rollout_data.append({
+                    'rl_log_probs': rollout_data.get('rl_log_probs'),
+                    'rl_value': rollout_data.get('rl_value'),
+                    'rl_attention_coords': rollout_data.get('rl_attention_coords'),
+                    'cancer_logits': rollout_data.get('cancer_logits'),
+                })
+                
+                # Compute reward for this rollout
+                reward = reward_computer(rollout_data, data)
+                all_rewards.append(reward)
+            
+            # Stack all samples: shape becomes (B * num_samples_per_image,)
+            # Interleaved: [img0_sample0, img0_sample1, ..., img1_sample0, img1_sample1, ...]
+            B = data['bmode'].shape[0]
+            
+            # Concatenate log_probs: (B, k) -> (B * num_samples, k)
+            old_log_probs_list = [rd['rl_log_probs'] for rd in all_rollout_data]
+            old_log_probs = torch.stack(old_log_probs_list, dim=1).view(B * num_samples_per_image, -1)
+            
+            # Concatenate values: (B, 1) -> (B * num_samples, 1)
+            old_values_list = [rd['rl_value'] for rd in all_rollout_data]
+            old_values = torch.stack(old_values_list, dim=1).view(B * num_samples_per_image, -1)
+            
+            # Concatenate rewards: (B,) -> (B * num_samples,)
+            rewards = torch.stack(all_rewards, dim=1).view(B * num_samples_per_image)
 
-        # Step 2: Compute rewards
-        rewards = reward_computer(rollout_data, data)
-
-        # Step 3: GRPO updates
+        # Step 2: GRPO updates with within-image advantage normalization
         num_rl_updates = args.get('rl_num_update_epochs', 4)
         rl_metrics_list = []
         
         for rl_epoch in range(num_rl_updates):
             with torch.amp.autocast('cuda', enabled=args.use_amp):
-                # Re-run model to get current policy
-                current_data = model(data, deterministic=False)
+                # Re-run model for each sample to get current policy
+                # We need to sample the same number of times
+                current_log_probs_list = []
+                current_values_list = []
                 
-                # Supervised loss
+                for sample_idx in range(num_samples_per_image):
+                    current_data = model(data, deterministic=False)
+                    current_log_probs_list.append(current_data.get('rl_log_probs'))
+                    current_values_list.append(current_data.get('rl_value'))
+                
+                # Stack current samples
+                current_log_probs = torch.stack(current_log_probs_list, dim=1).view(B * num_samples_per_image, -1)
+                current_values = torch.stack(current_values_list, dim=1).view(B * num_samples_per_image, -1)
+                
+                # Supervised loss (use last sample's data for supervised loss)
                 supervised_loss = criterion(current_data)
                 
-                # RL loss (GRPO)
+                # RL loss (GRPO) with within-image comparison
                 if old_log_probs is not None:
-                    current_log_probs = current_data.get('rl_log_probs')
-                    current_values = current_data.get('rl_value')
-                    
                     rl_loss, rl_info = grpo.compute_loss(
                         current_log_probs,
                         old_log_probs.detach(),
                         current_values,
                         rewards.detach(),
+                        num_samples_per_image=num_samples_per_image,
                     )
                     
                     # Combined loss
@@ -408,13 +459,19 @@ def run_rl_train_epoch(
                 avg_rl_metrics[f"train_rl/{key}"] = np.mean([m[key] for m in rl_metrics_list])
             step_metrics.update(avg_rl_metrics)
         
-        # Add reward stats
+        # Add reward stats (now computed within-image)
         step_metrics.update({
             "train_rl/reward_mean": rewards.mean().item(),
             "train_rl/reward_std": rewards.std().item(),
             "train_rl/reward_min": rewards.min().item(),
             "train_rl/reward_max": rewards.max().item(),
+            "train_rl/num_samples_per_image": num_samples_per_image,
         })
+        
+        # Compute within-image reward variance (to monitor diversity)
+        rewards_per_image = rewards.view(B, num_samples_per_image)
+        within_image_std = rewards_per_image.std(dim=1).mean().item()
+        step_metrics["train_rl/within_image_reward_std"] = within_image_std
         
         # Log learning rates
         if hasattr(model, 'get_params_groups'):

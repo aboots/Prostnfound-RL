@@ -1,5 +1,10 @@
 """
 RL-specific loss and reward computation for ProstNFound-RL
+
+Note on Within-Image Comparison:
+When using GRPO with within-image comparison (multiple samples per image),
+reward normalization should be done in GRPO's compute_advantages(), not here.
+Set normalize_rewards=False when using within-image comparison.
 """
 
 import torch
@@ -21,14 +26,16 @@ class RLRewardComputer:
     Args:
         reward_mode: Type of reward computation ('loss_based', 'accuracy_based', or 'combined')
         cspca_bonus: Bonus multiplier for csPCa cases (default: 2.0)
-        normalize_rewards: Whether to normalize rewards within batch (default: True)
+        normalize_rewards: Whether to normalize rewards within batch (default: False)
+            NOTE: When using within-image comparison in GRPO, set this to False
+            so that normalization happens within each image group in GRPO.
     """
     
     def __init__(
         self,
         reward_mode: str = 'loss_based',
         cspca_bonus: float = 2.0,
-        normalize_rewards: bool = True,
+        normalize_rewards: bool = False,  # Changed default to False for within-image comparison
     ):
         self.reward_mode = reward_mode
         self.cspca_bonus = cspca_bonus
@@ -241,10 +248,22 @@ def build_rl_reward_computer(args) -> RLRewardComputer:
         
     Returns:
         reward_computer: RLRewardComputer instance
+    
+    Note:
+        When using within-image comparison (rl_num_samples_per_image > 1),
+        reward normalization is handled by GRPO, so we disable it here.
     """
     reward_mode = args.get('rl_reward_mode', 'loss_based')
     cspca_bonus = args.get('rl_cspca_bonus', 2.0)
-    normalize_rewards = args.get('rl_normalize_rewards', True)
+    
+    # When using within-image comparison, normalization happens in GRPO
+    num_samples_per_image = args.get('rl_num_samples_per_image', 4)
+    if num_samples_per_image > 1:
+        # Within-image comparison: GRPO handles normalization
+        normalize_rewards = False
+    else:
+        # Fallback to batch normalization
+        normalize_rewards = args.get('rl_normalize_rewards', True)
     
     return RLRewardComputer(
         reward_mode=reward_mode,

@@ -25,7 +25,7 @@ data:
 
 model: prostnfound_adapter_medsam_legacy
 model_kw:
-  prompts: [age,psa]
+  prompts: []
   use_class_decoder: true
 
 loss: mil_prop_bce_entropy_reg
@@ -33,7 +33,7 @@ outside_prostate_penalty: false
 add_image_clf: true
 image_clf_mode: cspca
 
-name: "prostnfound+"
+name: "prostnfound+_withoutprompts"
 
 optimizer: adamw
 lr: 1.0e-05
@@ -58,7 +58,7 @@ save_checkpoint_wandb: false
 torch_compile: true
 use_amp: true
 device: cuda
-checkpoint_dir: checkpoints
+checkpoint_dir: checkpoints_without_prompts_baseline
 model_checkpoint: null
 debug: false
 save_best_weights: true

@@ -46,7 +46,9 @@ Clinical Prompts + Attention Prompts → Sparse Embeddings
 
 3. **GRPO** (`medAI/modeling/grpo.py`)
    - Group Relative Policy Optimization algorithm
-   - Normalizes advantages within batches for stability
+   - **Within-Image Comparison**: Samples multiple attention configurations per image
+   - Normalizes advantages within each image group (not across batch)
+   - This is critical because different images have different difficulty levels
    - Includes value function and entropy regularization
 
 4. **Reward Computer** (`prostnfound/src/rl_loss.py`)
@@ -143,7 +145,7 @@ use_rl: true  # Enable RL training
 rl_mode: grpo  # RL algorithm
 rl_reward_mode: loss_based  # 'loss_based', 'accuracy_based', or 'combined'
 rl_cspca_bonus: 2.0  # Reward multiplier for csPCa
-rl_normalize_rewards: true
+rl_normalize_rewards: true  # Only used when num_samples_per_image=1
 
 # GRPO hyperparameters
 rl_num_update_epochs: 4  # Updates per batch
@@ -152,7 +154,28 @@ rl_entropy_coef: 0.01  # Entropy bonus
 rl_value_coef: 0.5  # Value loss weight
 rl_max_grad_norm: 0.5  # Gradient clipping
 rl_gamma: 1.0  # Discount factor
+
+# Within-Image Comparison (key improvement!)
+# Instead of comparing across different images (which have different difficulty),
+# we sample multiple attention configurations per image and compare within each.
+rl_num_samples_per_image: 4  # Number of rollouts per image (set to 1 to disable)
 ```
+
+### Within-Image Comparison (Key Feature)
+
+A critical improvement in this implementation is **within-image comparison**. 
+
+**The Problem**: Different ultrasound images have different difficulty levels. Some images have clear cancer regions while others are ambiguous. If we normalize rewards/advantages across the entire batch, we're comparing apples to oranges - an easy image will always get higher rewards than a hard one.
+
+**The Solution**: For each image, we sample multiple rollouts (different attention location configurations) and compare them **within the same image**. This allows the model to learn:
+- "For this specific image, attention configuration A works better than B"
+- Rather than: "Image 1 with any configuration is better than Image 2"
+
+This is implemented by:
+1. Sampling `rl_num_samples_per_image` attention configurations per image
+2. Computing rewards for each configuration
+3. Normalizing advantages within each image group in GRPO
+4. This provides a fair comparison regardless of image difficulty
 
 ### Hyperparameter Tuning
 
@@ -163,6 +186,7 @@ Key hyperparameters to tune:
 3. **rl_cspca_bonus** (1.5-3.0): Higher = focus more on csPCa
 4. **rl_entropy_coef** (0.001-0.05): Higher = more exploration
 5. **temperature** (0.5-2.0): Higher = more stochastic sampling
+6. **rl_num_samples_per_image** (4-8): More samples = better within-image comparison, but slower training. Set to 1 to disable within-image comparison.
 
 ## Evaluation
 
@@ -181,6 +205,7 @@ Additional metrics logged during training:
 - `train_rl/entropy`: Policy entropy (exploration)
 - `train_rl/value_loss`: Value function loss
 - `train_rl/ratio_mean`: Policy update ratio
+- `train_rl/within_image_reward_std`: Standard deviation of rewards within each image (measures diversity of sampled attention configurations)
 
 ### Visualizing Attention Points
 

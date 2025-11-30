@@ -29,7 +29,7 @@ data:
 # Model configuration
 model: prostnfound_rl_adapter_medsam_legacy
 model_kw:
-  prompts: [age,psa]
+  prompts: [psa,age]
   use_class_decoder: true
   # RL-specific parameters
   num_attention_points: 3  # Number of attention points to identify
@@ -50,7 +50,7 @@ use_rl: true  # Enable RL training mode
 rl_mode: grpo  # RL algorithm (grpo, ppo, reinforce)
 rl_reward_mode: loss_based  # 'loss_based', 'accuracy_based', or 'combined'
 rl_cspca_bonus: 2.0  # Bonus multiplier for csPCa cases
-rl_normalize_rewards: true
+rl_normalize_rewards: true  # Only used when num_samples_per_image=1
 rl_num_update_epochs: 4  # Number of GRPO update epochs per batch
 rl_clip_eps: 0.2  # PPO clipping epsilon
 rl_entropy_coef: 0.01  # Entropy coefficient
@@ -58,7 +58,13 @@ rl_value_coef: 0.5  # Value loss coefficient
 rl_max_grad_norm: 0.5  # Gradient clipping
 rl_gamma: 1.0  # Discount factor (1.0 = no discounting)
 
-name: "prostnfound-rl"
+# Within-Image Comparison (key improvement)
+# Instead of comparing performance across different images (which have different difficulty),
+# we sample multiple attention location configurations per image and compare within each image.
+# This allows fair comparison and helps the model learn which attention strategies work best.
+rl_num_samples_per_image: 4  # Number of rollouts per image (set to 1 to disable)
+
+name: "prostnfound-rl-within-image-v2"  # Changed name for fresh run
 
 # Optimizer configuration
 optimizer: adamw
@@ -80,12 +86,16 @@ project: prostnfound_rl
 seed: 30
 tracked_metric: val/core_auc_high_involvement
 
+wandb:
+  mode: online  # Set to "online" to sync to wandb.ai (requires authentication)
+  # mode: offline  # Set to "offline" to save locally only
+
 save_checkpoint_wandb: false
 torch_compile: false  # Disable for RL (can cause issues with dynamic graphs)
 use_amp: true
 device: cuda
-checkpoint_dir: checkpoints
-model_checkpoint: null  # Can load baseline ProstNFound+ checkpoint here
+checkpoint_dir: checkpoints_rl_variations/${name} # New checkpoint directory for fresh run
+model_checkpoint: null  # No checkpoint - train from scratch
 debug: false
 save_best_weights: true
 

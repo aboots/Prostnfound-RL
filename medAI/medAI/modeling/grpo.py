@@ -1,9 +1,16 @@
 """
 Group Relative Policy Optimization (GRPO) for ProstNFound-RL
 
-GRPO is a policy gradient method that normalizes advantages within groups (batches)
+GRPO is a policy gradient method that normalizes advantages within groups
 to improve training stability. It's particularly useful for on-policy RL in domains
 with high variance rewards.
+
+Key Innovation for Medical Imaging:
+- Within-Image Comparison: Different images have different difficulty levels.
+  Instead of comparing across images (batch normalization), we sample multiple
+  rollouts (attention location selections) per image and normalize advantages
+  WITHIN each image. This allows the model to learn which attention locations
+  work better for each specific image.
 
 Reference: 
 DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models
@@ -19,14 +26,13 @@ import logging
 
 class GRPO:
     """
-    Group Relative Policy Optimization.
+    Group Relative Policy Optimization with Within-Image Comparison.
     
-    This implements a simplified version of GRPO suitable for our medical imaging task.
-    The key idea is to:
-    1. Sample multiple rollouts per example
-    2. Compute rewards for each rollout
-    3. Normalize advantages within each group (batch)
-    4. Update policy using policy gradient with the normalized advantages
+    This implements GRPO for medical imaging tasks where:
+    1. Each image is sampled multiple times (different attention locations)
+    2. Rewards are computed for each sample
+    3. Advantages are normalized WITHIN each image group (not across batch)
+    4. This allows fair comparison of attention strategies per image
     
     Args:
         clip_eps: Clipping epsilon for PPO-style clipping (default: 0.2)
@@ -35,6 +41,7 @@ class GRPO:
         max_grad_norm: Maximum gradient norm for clipping (default: 0.5)
         gamma: Discount factor for future rewards (default: 1.0, no discounting)
         normalize_advantages: Whether to normalize advantages (default: True)
+        num_samples_per_image: Number of rollouts per image for within-image comparison (default: 1)
     """
     
     def __init__(
@@ -45,6 +52,7 @@ class GRPO:
         max_grad_norm: float = 0.5,
         gamma: float = 1.0,
         normalize_advantages: bool = True,
+        num_samples_per_image: int = 1,
     ):
         self.clip_eps = clip_eps
         self.entropy_coef = entropy_coef
@@ -52,30 +60,34 @@ class GRPO:
         self.max_grad_norm = max_grad_norm
         self.gamma = gamma
         self.normalize_advantages = normalize_advantages
+        self.num_samples_per_image = num_samples_per_image
         
         logging.info(
             f"Initialized GRPO with clip_eps={clip_eps}, entropy_coef={entropy_coef}, "
-            f"value_coef={value_coef}, gamma={gamma}"
+            f"value_coef={value_coef}, gamma={gamma}, num_samples_per_image={num_samples_per_image}"
         )
     
     def compute_advantages(
         self,
         rewards: torch.Tensor,
         values: torch.Tensor,
+        num_samples_per_image: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Compute advantages using simple advantage estimation.
+        Compute advantages with within-image normalization.
         
-        For our task, we have single-step rewards (no temporal structure),
-        so the advantage is simply reward - value_estimate.
+        For within-image comparison, we have multiple samples per image.
+        Advantages are normalized within each image group, not across the batch.
+        This accounts for different difficulty levels across images.
         
         Args:
-            rewards: Rewards for each sample (B,)
-            values: Value estimates for each sample (B, 1)
+            rewards: Rewards for each sample (B * num_samples,) or (B,)
+            values: Value estimates for each sample (B * num_samples, 1) or (B, 1)
+            num_samples_per_image: Number of samples per image (overrides self.num_samples_per_image)
             
         Returns:
-            advantages: Computed advantages (B,)
-            returns: Target returns for value function (B,)
+            advantages: Computed advantages (B * num_samples,) or (B,)
+            returns: Target returns for value function (B * num_samples,) or (B,)
         """
         if values.ndim > 1:
             values = values.squeeze(-1)
@@ -86,9 +98,37 @@ class GRPO:
         # Advantage = return - value
         advantages = returns - values
         
-        # Normalize advantages within the batch (key idea of GRPO)
+        num_samples = num_samples_per_image if num_samples_per_image is not None else self.num_samples_per_image
+        
+        # Normalize advantages
         if self.normalize_advantages:
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+            if num_samples > 1:
+                # Within-image normalization: normalize within each image group
+                total_samples = advantages.shape[0]
+                num_images = total_samples // num_samples
+                
+                if total_samples == num_images * num_samples:
+                    # Reshape to (num_images, num_samples)
+                    advantages_grouped = advantages.view(num_images, num_samples)
+                    
+                    # Normalize within each image group
+                    group_mean = advantages_grouped.mean(dim=1, keepdim=True)
+                    group_std = advantages_grouped.std(dim=1, keepdim=True) + 1e-8
+                    advantages_grouped = (advantages_grouped - group_mean) / group_std
+                    
+                    # Flatten back
+                    advantages = advantages_grouped.view(-1)
+                else:
+                    # Fallback to batch normalization if shapes don't match
+                    logging.warning(
+                        f"Within-image normalization failed: total_samples={total_samples}, "
+                        f"num_images={num_images}, num_samples={num_samples}. "
+                        "Falling back to batch normalization."
+                    )
+                    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+            else:
+                # Standard batch normalization (fallback for num_samples=1)
+                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         
         return advantages, returns
     
@@ -172,22 +212,26 @@ class GRPO:
         old_log_probs: torch.Tensor,
         values: torch.Tensor,
         rewards: torch.Tensor,
+        num_samples_per_image: Optional[int] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
-        Compute total GRPO loss.
+        Compute total GRPO loss with within-image comparison.
         
         Args:
-            log_probs: Current log probabilities (B, k)
-            old_log_probs: Old log probabilities (B, k)
-            values: Value estimates (B, 1) or (B,)
-            rewards: Rewards (B,)
+            log_probs: Current log probabilities (B * num_samples, k)
+            old_log_probs: Old log probabilities (B * num_samples, k)
+            values: Value estimates (B * num_samples, 1) or (B * num_samples,)
+            rewards: Rewards (B * num_samples,)
+            num_samples_per_image: Number of samples per image for within-image normalization
             
         Returns:
             total_loss: Combined policy and value loss
             info: Dictionary with loss components
         """
-        # Compute advantages
-        advantages, returns = self.compute_advantages(rewards, values)
+        # Compute advantages with within-image normalization
+        advantages, returns = self.compute_advantages(
+            rewards, values, num_samples_per_image=num_samples_per_image
+        )
         
         # Compute policy loss
         policy_loss, policy_info = self.compute_policy_loss(
@@ -204,6 +248,10 @@ class GRPO:
         info = policy_info
         info['value_loss'] = value_loss.item()
         info['total_loss'] = total_loss.item()
+        
+        # Add within-image comparison info
+        if num_samples_per_image is not None and num_samples_per_image > 1:
+            info['num_samples_per_image'] = num_samples_per_image
         
         return total_loss, info
     
@@ -253,11 +301,16 @@ class GRPOTrainer:
     """
     Trainer for GRPO that manages rollout collection and multiple update epochs.
     
+    Supports within-image comparison: instead of comparing performance across different
+    images (which have different difficulty), we sample multiple rollouts per image
+    and compare them within each image.
+    
     Args:
         model: The RL model (ProstNFoundRL)
         optimizer: Optimizer for model parameters
         grpo: GRPO algorithm instance
         num_update_epochs: Number of epochs to train on each batch (default: 4)
+        num_samples_per_image: Number of rollouts per image for within-image comparison (default: 4)
         device: Device to use (default: 'cuda')
     """
     
@@ -267,22 +320,76 @@ class GRPOTrainer:
         optimizer: torch.optim.Optimizer,
         grpo: Optional[GRPO] = None,
         num_update_epochs: int = 4,
+        num_samples_per_image: int = 4,
         device: str = 'cuda',
     ):
         self.model = model
         self.optimizer = optimizer
-        self.grpo = grpo if grpo is not None else GRPO()
+        self.grpo = grpo if grpo is not None else GRPO(num_samples_per_image=num_samples_per_image)
         self.num_update_epochs = num_update_epochs
+        self.num_samples_per_image = num_samples_per_image
         self.device = device
         
-        logging.info(f"Initialized GRPOTrainer with {num_update_epochs} update epochs")
+        logging.info(
+            f"Initialized GRPOTrainer with {num_update_epochs} update epochs, "
+            f"{num_samples_per_image} samples per image for within-image comparison"
+        )
+    
+    def collect_rollouts(
+        self,
+        data: Dict[str, torch.Tensor],
+    ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
+        """
+        Collect multiple rollouts per image for within-image comparison.
+        
+        Args:
+            data: Batch of data
+            
+        Returns:
+            rollout_data: Data needed for GRPO update (log_probs, values, etc.)
+                          Shapes are (B * num_samples_per_image, ...)
+            outputs_list: List of outputs for reward computation
+        """
+        B = data['bmode'].shape[0]
+        all_log_probs = []
+        all_values = []
+        all_outputs = []
+        
+        # Sample multiple rollouts per image
+        with torch.no_grad():
+            for sample_idx in range(self.num_samples_per_image):
+                outputs = self.model(
+                    data['bmode'],
+                    rf_image=data.get('rf'),
+                    prostate_mask=data['prostate_mask'],
+                    needle_mask=data['needle_mask'],
+                    deterministic=False,  # Sample from policy
+                    return_rl_info=True,
+                    **{k: v for k, v in data.items() if k in self.model.prompts}
+                )
+                
+                all_log_probs.append(outputs['rl_log_probs'])
+                all_values.append(outputs['rl_value'])
+                all_outputs.append(outputs)
+        
+        # Stack and reshape: (B, num_samples, ...) -> (B * num_samples, ...)
+        stacked_log_probs = torch.stack(all_log_probs, dim=1)  # (B, num_samples, k)
+        stacked_values = torch.stack(all_values, dim=1)  # (B, num_samples, 1)
+        
+        rollout_data = {
+            'log_probs': stacked_log_probs.view(B * self.num_samples_per_image, -1).detach(),
+            'values': stacked_values.view(B * self.num_samples_per_image, -1).detach(),
+        }
+        
+        return rollout_data, all_outputs
     
     def collect_rollout(
         self,
         data: Dict[str, torch.Tensor],
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         """
-        Collect a rollout by running the model on data.
+        Collect a single rollout by running the model on data.
+        (Legacy method for backward compatibility)
         
         Args:
             data: Batch of data
@@ -373,18 +480,46 @@ class GRPOTrainer:
         
         return rewards
     
+    def compute_rewards_for_rollouts(
+        self,
+        outputs_list: list,
+        data: Dict[str, torch.Tensor],
+        criterion: nn.Module,
+    ) -> torch.Tensor:
+        """
+        Compute rewards for multiple rollouts per image.
+        
+        Args:
+            outputs_list: List of outputs from each rollout
+            data: Batch data with labels
+            criterion: Loss function
+            
+        Returns:
+            rewards: Rewards shaped (B * num_samples_per_image,)
+        """
+        B = len(data['bmode'])
+        all_rewards = []
+        
+        for outputs in outputs_list:
+            rewards = self.compute_rewards(outputs, data, criterion)
+            all_rewards.append(rewards)
+        
+        # Stack and reshape: (num_samples, B) -> (B * num_samples,)
+        stacked_rewards = torch.stack(all_rewards, dim=1)  # (B, num_samples)
+        return stacked_rewards.view(B * self.num_samples_per_image)
+    
     def train_step(
         self,
         data: Dict[str, torch.Tensor],
         criterion: nn.Module,
     ) -> Dict[str, float]:
         """
-        Perform one GRPO training step.
+        Perform one GRPO training step with within-image comparison.
         
         This involves:
-        1. Collecting rollout (sampling from policy)
-        2. Computing rewards
-        3. Multiple update epochs with GRPO
+        1. Collecting multiple rollouts per image (sampling different attention locations)
+        2. Computing rewards for each rollout
+        3. Multiple update epochs with GRPO using within-image advantage normalization
         
         Args:
             data: Batch of data
@@ -393,37 +528,66 @@ class GRPOTrainer:
         Returns:
             info: Dictionary with training metrics
         """
-        # Step 1: Collect rollout
-        outputs, rollout_data = self.collect_rollout(data)
+        B = data['bmode'].shape[0]
         
-        # Step 2: Compute rewards
-        rewards = self.compute_rewards(outputs, data, criterion)
+        # Step 1: Collect multiple rollouts per image
+        rollout_data, outputs_list = self.collect_rollouts(data)
         
-        # Step 3: Multiple update epochs
+        # Step 2: Compute rewards for all rollouts
+        rewards = self.compute_rewards_for_rollouts(outputs_list, data, criterion)
+        
+        # Step 3: Multiple update epochs with within-image comparison
         update_info_list = []
         for epoch in range(self.num_update_epochs):
-            # Re-run model with same data to get current log_probs
+            # Re-run model for each sample to get current policy
             self.model.train()
-            outputs = self.model(
-                data['bmode'],
-                rf_image=data.get('rf'),
-                prostate_mask=data['prostate_mask'],
-                needle_mask=data['needle_mask'],
-                deterministic=False,
-                return_rl_info=True,
-                **{k: v for k, v in data.items() if k in self.model.prompts}
+            current_log_probs_list = []
+            current_values_list = []
+            
+            for sample_idx in range(self.num_samples_per_image):
+                outputs = self.model(
+                    data['bmode'],
+                    rf_image=data.get('rf'),
+                    prostate_mask=data['prostate_mask'],
+                    needle_mask=data['needle_mask'],
+                    deterministic=False,
+                    return_rl_info=True,
+                    **{k: v for k, v in data.items() if k in self.model.prompts}
+                )
+                current_log_probs_list.append(outputs['rl_log_probs'])
+                current_values_list.append(outputs['rl_value'])
+            
+            # Stack current samples
+            current_log_probs = torch.stack(current_log_probs_list, dim=1).view(
+                B * self.num_samples_per_image, -1
+            )
+            current_values = torch.stack(current_values_list, dim=1).view(
+                B * self.num_samples_per_image, -1
             )
             
-            # Perform GRPO update
-            update_info = self.grpo.update(
-                model=self.model,
-                optimizer=self.optimizer,
-                log_probs=outputs['rl_log_probs'],
-                old_log_probs=rollout_data['log_probs'],
-                values=outputs['rl_value'],
-                rewards=rewards,
+            # Compute GRPO loss with within-image comparison
+            loss, info = self.grpo.compute_loss(
+                current_log_probs,
+                rollout_data['log_probs'],
+                current_values,
+                rewards,
+                num_samples_per_image=self.num_samples_per_image,
             )
-            update_info_list.append(update_info)
+            
+            # Backward pass
+            self.optimizer.zero_grad()
+            loss.backward()
+            
+            # Gradient clipping
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), self.grpo.max_grad_norm
+            )
+            info['grad_norm'] = grad_norm.item()
+            
+            # Optimizer step
+            self.optimizer.step()
+            
+            update_info_list.append(info)
         
         # Average metrics across update epochs
         avg_info = {}
@@ -435,6 +599,11 @@ class GRPOTrainer:
         avg_info['reward_std'] = rewards.std().item()
         avg_info['reward_min'] = rewards.min().item()
         avg_info['reward_max'] = rewards.max().item()
+        avg_info['num_samples_per_image'] = self.num_samples_per_image
+        
+        # Compute within-image reward variance
+        rewards_per_image = rewards.view(B, self.num_samples_per_image)
+        avg_info['within_image_reward_std'] = rewards_per_image.std(dim=1).mean().item()
         
         return avg_info
 
