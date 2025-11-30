@@ -123,7 +123,17 @@ def main(cfg):
         msg = model.load_state_dict(model_state, strict=False)
         logging.info(f"Loaded model from {cfg.model_checkpoint} with message `{msg}`.")
     if state is not None:
-        model.load_state_dict(state["model"])
+        # If RL model, filter out policy weights to avoid loading corrupted weights from old BatchNorm training
+        if is_rl_model:
+            logging.info("Filtering out policy network weights from checkpoint (will reinitialize fresh)")
+            state_dict = state["model"]
+            # Remove all keys containing 'policy' to start fresh with GroupNorm
+            filtered_state_dict = {k: v for k, v in state_dict.items() if 'policy' not in k}
+            msg = model.load_state_dict(filtered_state_dict, strict=False)
+            logging.info(f"Loaded experiment state (excluding policy) with message `{msg}`.")
+        else:
+            msg = model.load_state_dict(state["model"], strict=False)
+            logging.info(f"Loaded experiment state with message `{msg}`.")
 
     # setup criterion
     criterion = build_loss(cfg)
@@ -163,8 +173,14 @@ def main(cfg):
 
     optimizer, lr_scheduler = setup_optimizer(cfg, model, train_loader)
     if state is not None:
-        optimizer.load_state_dict(state["optimizer"])
-        lr_scheduler.load_state_dict(state["lr_scheduler"])
+        # If RL model with reinitialized policy, optimizer state might be incompatible
+        # Load with error handling
+        try:
+            optimizer.load_state_dict(state["optimizer"])
+            lr_scheduler.load_state_dict(state["lr_scheduler"])
+        except Exception as e:
+            logging.warning(f"Could not load optimizer/scheduler state: {e}")
+            logging.warning("Continuing with fresh optimizer state (this is expected when reinitializing policy)")
 
     scaler = torch.amp.GradScaler('cuda')
     if state is not None:
@@ -348,6 +364,11 @@ def run_rl_train_epoch(
             
             for sample_idx in range(num_samples_per_image):
                 # Sample from policy (non-deterministic)
+                if torch.isnan(data["prostate_mask"]).any():
+                    logging.error(f"NaNs detected in prostate_mask at sample {sample_idx}!")
+                if torch.isnan(data["bmode"]).any():
+                    logging.error(f"NaNs detected in bmode at sample {sample_idx}!")
+                
                 rollout_data = model(data, deterministic=False)
                 
                 # Store rollout data
@@ -355,6 +376,7 @@ def run_rl_train_epoch(
                     'rl_log_probs': rollout_data.get('rl_log_probs'),
                     'rl_value': rollout_data.get('rl_value'),
                     'rl_attention_coords': rollout_data.get('rl_attention_coords'),
+                    'rl_actions': rollout_data.get('rl_actions'),
                     'cancer_logits': rollout_data.get('cancer_logits'),
                 })
                 
@@ -389,7 +411,16 @@ def run_rl_train_epoch(
                 current_values_list = []
                 
                 for sample_idx in range(num_samples_per_image):
+                    # IMPORTANT: Use the SAME actions (attention points) as in rollout
+                    # to compute the current log probabilities for those actions.
+                    # We pass the stored actions to the model.
+                    data['rl_actions'] = all_rollout_data[sample_idx]['rl_actions']
+                    
                     current_data = model(data, deterministic=False)
+                    
+                    # Clean up to avoid side effects
+                    del data['rl_actions']
+                    
                     current_log_probs_list.append(current_data.get('rl_log_probs'))
                     current_values_list.append(current_data.get('rl_value'))
                 
@@ -628,11 +659,19 @@ class ProstNFoundMeta(nn.Module):
                     prompts[prompt_name] = prompts[prompt_name][:, None]
 
             if self.is_rl:
+                # Check if we have pre-defined actions (for PPO update)
+                rl_actions = data.get('rl_actions')
+                if isinstance(rl_actions, list):
+                     # If it's a list (from collate?), stack it?
+                     # Usually it should be a tensor if properly collated or passed manually
+                     pass
+                
                 outputs = self.model(
                     bmode, rf, prostate_mask, needle_mask, 
                     output_mode="all", 
                     deterministic=deterministic,
                     return_rl_info=True,
+                    rl_actions=rl_actions,
                     **prompts
                 )
             else:
@@ -651,6 +690,8 @@ class ProstNFoundMeta(nn.Module):
                 data["rl_log_probs"] = outputs.get("rl_log_probs")
                 data["rl_attention_map"] = outputs.get("rl_attention_map")
                 data["rl_value"] = outputs.get("rl_value")
+                data["rl_outside_prostate_ratio"] = outputs.get("rl_outside_prostate_ratio")
+                data["rl_actions"] = outputs.get("rl_actions")
         else:
             model_outputs = self.model(bmode)
             if isinstance(model_outputs, dict):

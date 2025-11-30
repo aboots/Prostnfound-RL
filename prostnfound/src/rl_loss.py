@@ -5,12 +5,18 @@ Note on Within-Image Comparison:
 When using GRPO with within-image comparison (multiple samples per image),
 reward normalization should be done in GRPO's compute_advantages(), not here.
 Set normalize_rewards=False when using within-image comparison.
+
+Key Improvements:
+1. Reduced csPCa bonus (1.25x default instead of 2.0x) for more stable learning
+2. Involvement-aware reward smoothing to handle noisy labels
+3. Outside prostate penalty to keep attention within valid regions
+4. Correct prediction bonus for improved reward signal
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict
+from typing import Dict, Optional
 from medAI.layers.masked_prediction_module import MaskedPredictionModule
 
 
@@ -20,38 +26,60 @@ class RLRewardComputer:
     
     The reward function is designed to:
     1. Encourage correct cancer detection
-    2. Heavily reward correct identification of clinically significant PCa (csPCa)
+    2. Moderately reward correct identification of clinically significant PCa (csPCa)
     3. Penalize false positives and false negatives
+    4. Penalize attention points outside prostate region
     
     Args:
         reward_mode: Type of reward computation ('loss_based', 'accuracy_based', or 'combined')
-        cspca_bonus: Bonus multiplier for csPCa cases (default: 2.0)
+        cspca_bonus: Bonus multiplier for csPCa cases (default: 1.25, reduced from 2.0)
+            Lower values provide more stable learning as involvement labels can be noisy
         normalize_rewards: Whether to normalize rewards within batch (default: False)
             NOTE: When using within-image comparison in GRPO, set this to False
             so that normalization happens within each image group in GRPO.
+        outside_prostate_penalty: Penalty for attention points outside prostate (default: 0.3)
+            Applied as: reward = reward * (1 - penalty * outside_ratio)
+        use_involvement_smoothing: Whether to smooth involvement-based rewards (default: True)
+            Helps handle noisy involvement labels by using softer targets
+        correct_pred_bonus: Bonus for correct binary predictions (default: 0.2)
+            Provides additional reward signal when prediction direction is correct
     """
     
     def __init__(
         self,
         reward_mode: str = 'loss_based',
-        cspca_bonus: float = 2.0,
+        cspca_bonus: float = 1.25,  # Reduced from 2.0 for more stable learning
         normalize_rewards: bool = False,  # Changed default to False for within-image comparison
+        outside_prostate_penalty: float = 0.3,
+        use_involvement_smoothing: bool = True,
+        correct_pred_bonus: float = 0.2,
     ):
         self.reward_mode = reward_mode
         self.cspca_bonus = cspca_bonus
         self.normalize_rewards = normalize_rewards
+        self.outside_prostate_penalty = outside_prostate_penalty
+        self.use_involvement_smoothing = use_involvement_smoothing
+        self.correct_pred_bonus = correct_pred_bonus
     
     def compute_loss_based_reward(
         self,
         cancer_logits: torch.Tensor,
         data: Dict[str, torch.Tensor],
+        outside_prostate_ratio: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Compute reward based on BCE loss (lower loss = higher reward).
         
+        Improvements over original:
+        - Involvement smoothing to handle noisy labels
+        - Correct prediction bonus for better gradient signal
+        - Outside prostate penalty
+        - Reduced csPCa bonus for stability
+        
         Args:
             cancer_logits: Predicted cancer logits (B, 1, H, W)
             data: Batch data containing labels and masks
+            outside_prostate_ratio: Fraction of attention points outside prostate (B,)
             
         Returns:
             rewards: Reward for each sample (B,)
@@ -64,6 +92,8 @@ class RLRewardComputer:
         involvement = data['involvement'].to(device)
         
         rewards = []
+        correct_preds = []
+        
         for i in range(B):
             # Get mask for valid region
             mask = torch.ones(prostate_mask[i].shape, device=device).bool()
@@ -77,11 +107,26 @@ class RLRewardComputer:
             
             if len(predictions) == 0:
                 rewards.append(0.0)
+                correct_preds.append(False)
                 continue
             
-            # Compute BCE loss
-            target = involvement[i].item()
             pred_prob = predictions.sigmoid().mean()
+            target = involvement[i].item()
+            
+            # Involvement smoothing: soften targets to handle noise
+            # Instead of using raw involvement (often 0 or 1), use smoothed version
+            if self.use_involvement_smoothing:
+                # Smooth towards 0.5 for uncertain cases
+                # High involvement (>0.7) stays high, low (<0.3) stays low
+                # Middle values get smoothed more
+                if target > 0.7:
+                    smoothed_target = 0.8 + 0.2 * (target - 0.7) / 0.3
+                elif target < 0.3:
+                    smoothed_target = 0.2 * target / 0.3
+                else:
+                    # Middle range: more smoothing towards 0.5
+                    smoothed_target = 0.3 + 0.4 * (target - 0.3) / 0.4
+                target = smoothed_target
             
             # BCE: -[y*log(p) + (1-y)*log(1-p)]
             bce = -(target * torch.log(pred_prob + 1e-8) + 
@@ -90,14 +135,30 @@ class RLRewardComputer:
             # Reward is negative loss (scaled)
             reward = -bce.item() / 2.0  # Scale to roughly [-1, 0]
             
+            # Check if prediction is correct (for bonus)
+            is_correct = (pred_prob > 0.5) == (involvement[i].item() > 0.5)
+            correct_preds.append(is_correct)
+            
             rewards.append(reward)
         
-        rewards = torch.tensor(rewards, device=device)
+        rewards = torch.tensor(rewards, device=device, dtype=torch.float32)
         
-        # Add csPCa bonus
+        # Add correct prediction bonus
+        if self.correct_pred_bonus > 0:
+            correct_mask = torch.tensor(correct_preds, device=device, dtype=torch.float32)
+            rewards = rewards + self.correct_pred_bonus * correct_mask
+        
+        # Add csPCa bonus (now reduced to 1.25x default)
         if 'grade_group' in data:
-            cspca_mask = data['grade_group'] > 2
-            rewards[cspca_mask] *= self.cspca_bonus
+            grade_group = data['grade_group'].to(device)
+            cspca_mask = grade_group > 2
+            rewards[cspca_mask] = rewards[cspca_mask] * self.cspca_bonus
+        
+        # Apply outside prostate penalty
+        if outside_prostate_ratio is not None and self.outside_prostate_penalty > 0:
+            # Penalty increases with ratio of points outside prostate
+            penalty_factor = 1.0 - self.outside_prostate_penalty * outside_prostate_ratio.to(device)
+            rewards = rewards * penalty_factor
         
         # Normalize rewards
         if self.normalize_rewards and len(rewards) > 1:
@@ -109,6 +170,7 @@ class RLRewardComputer:
         self,
         cancer_logits: torch.Tensor,
         data: Dict[str, torch.Tensor],
+        outside_prostate_ratio: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Compute reward based on prediction accuracy.
@@ -116,6 +178,7 @@ class RLRewardComputer:
         Args:
             cancer_logits: Predicted cancer logits (B, 1, H, W)
             data: Batch data
+            outside_prostate_ratio: Fraction of attention points outside prostate (B,)
             
         Returns:
             rewards: Reward for each sample (B,)
@@ -152,12 +215,18 @@ class RLRewardComputer:
             
             rewards.append(reward)
         
-        rewards = torch.tensor(rewards, device=device)
+        rewards = torch.tensor(rewards, device=device, dtype=torch.float32)
         
-        # Add csPCa bonus
+        # Add csPCa bonus (reduced)
         if 'grade_group' in data:
-            cspca_mask = data['grade_group'] > 2
-            rewards[cspca_mask] *= self.cspca_bonus
+            grade_group = data['grade_group'].to(device)
+            cspca_mask = grade_group > 2
+            rewards[cspca_mask] = rewards[cspca_mask] * self.cspca_bonus
+        
+        # Apply outside prostate penalty
+        if outside_prostate_ratio is not None and self.outside_prostate_penalty > 0:
+            penalty_factor = 1.0 - self.outside_prostate_penalty * outside_prostate_ratio.to(device)
+            rewards = rewards * penalty_factor
         
         return rewards
     
@@ -171,6 +240,7 @@ class RLRewardComputer:
         
         Args:
             outputs: Model outputs (data dict with 'cancer_logits' added)
+                Can also contain 'rl_outside_prostate_ratio' for penalty
             data: Original batch data
             
         Returns:
@@ -182,13 +252,16 @@ class RLRewardComputer:
         if cancer_logits is None:
             raise KeyError("Could not find 'cancer_logits' or 'mask_logits' in outputs")
         
+        # Get outside prostate ratio if available
+        outside_prostate_ratio = outputs.get('rl_outside_prostate_ratio', None)
+        
         if self.reward_mode == 'loss_based':
-            return self.compute_loss_based_reward(cancer_logits, data)
+            return self.compute_loss_based_reward(cancer_logits, data, outside_prostate_ratio)
         elif self.reward_mode == 'accuracy_based':
-            return self.compute_accuracy_based_reward(cancer_logits, data)
+            return self.compute_accuracy_based_reward(cancer_logits, data, outside_prostate_ratio)
         elif self.reward_mode == 'combined':
-            loss_reward = self.compute_loss_based_reward(cancer_logits, data)
-            acc_reward = self.compute_accuracy_based_reward(cancer_logits, data)
+            loss_reward = self.compute_loss_based_reward(cancer_logits, data, outside_prostate_ratio)
+            acc_reward = self.compute_accuracy_based_reward(cancer_logits, data, outside_prostate_ratio)
             return 0.5 * loss_reward + 0.5 * acc_reward
         else:
             raise ValueError(f"Unknown reward_mode: {self.reward_mode}")
@@ -254,7 +327,10 @@ def build_rl_reward_computer(args) -> RLRewardComputer:
         reward normalization is handled by GRPO, so we disable it here.
     """
     reward_mode = args.get('rl_reward_mode', 'loss_based')
-    cspca_bonus = args.get('rl_cspca_bonus', 2.0)
+    cspca_bonus = args.get('rl_cspca_bonus', 1.25)  # Reduced default from 2.0
+    outside_prostate_penalty = args.get('rl_outside_prostate_penalty', 0.3)
+    use_involvement_smoothing = args.get('rl_use_involvement_smoothing', True)
+    correct_pred_bonus = args.get('rl_correct_pred_bonus', 0.2)
     
     # When using within-image comparison, normalization happens in GRPO
     num_samples_per_image = args.get('rl_num_samples_per_image', 4)
@@ -269,5 +345,8 @@ def build_rl_reward_computer(args) -> RLRewardComputer:
         reward_mode=reward_mode,
         cspca_bonus=cspca_bonus,
         normalize_rewards=normalize_rewards,
+        outside_prostate_penalty=outside_prostate_penalty,
+        use_involvement_smoothing=use_involvement_smoothing,
+        correct_pred_bonus=correct_pred_bonus,
     )
 

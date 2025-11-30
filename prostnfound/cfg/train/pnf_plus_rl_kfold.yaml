@@ -1,6 +1,8 @@
 # ProstNFound-RL training configuration
 # This config adds RL-guided attention to ProstNFound+
 
+name: "prostnfound-rl-v4-improved"  # v3: prostate mask penalty, attention gating, improved rewards
+
 data:
   fold: 0
   n_folds: 5
@@ -38,6 +40,11 @@ model_kw:
   use_clinical_in_policy: true
   freeze_prostnfound: false  # Set to true to only train RL policy
   temperature: 1.0
+  # NEW: Prostate mask constraint - penalizes attention outside prostate
+  prostate_mask_penalty: 10.0  # Higher = stronger constraint to stay inside prostate
+  # NEW: Attention gating - makes decoder focus on RL-prompted regions
+  use_attention_gating: true  # Enable attention gating for decoder
+  attention_gate_strength: 0.3  # Strength of gating (0-1, higher = stronger focus)
 
 # Loss configuration
 loss: mil_prop_bce_entropy_reg
@@ -49,7 +56,13 @@ image_clf_mode: cspca
 use_rl: true  # Enable RL training mode
 rl_mode: grpo  # RL algorithm (grpo, ppo, reinforce)
 rl_reward_mode: loss_based  # 'loss_based', 'accuracy_based', or 'combined'
-rl_cspca_bonus: 2.0  # Bonus multiplier for csPCa cases
+
+# Reward function improvements
+rl_cspca_bonus: 1.25  # REDUCED from 2.0 - more stable learning with noisy involvement labels
+rl_outside_prostate_penalty: 0.3  # NEW: Penalty for attention points outside prostate
+rl_use_involvement_smoothing: true  # NEW: Smooth involvement targets to handle noise
+rl_correct_pred_bonus: 0.2  # NEW: Bonus for correct binary predictions
+
 rl_normalize_rewards: true  # Only used when num_samples_per_image=1
 rl_num_update_epochs: 4  # Number of GRPO update epochs per batch
 rl_clip_eps: 0.2  # PPO clipping epsilon
@@ -64,7 +77,6 @@ rl_gamma: 1.0  # Discount factor (1.0 = no discounting)
 # This allows fair comparison and helps the model learn which attention strategies work best.
 rl_num_samples_per_image: 4  # Number of rollouts per image (set to 1 to disable)
 
-name: "prostnfound-rl-within-image-v2"  # Changed name for fresh run
 
 # Optimizer configuration
 optimizer: adamw
