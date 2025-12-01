@@ -259,6 +259,61 @@ def main(cfg):
     logging.info("Finished RL training")
 
 
+def compute_coords_inside_prostate_stats(rl_coords, prostate_mask):
+    """
+    Compute statistics about how many RL attention coordinates are inside vs outside prostate.
+    
+    Args:
+        rl_coords: Attention coordinates (B, num_points, 2) in [x, y] format, in 256x256 space
+        prostate_mask: Prostate segmentation mask (B, 1, H, W), may be downsampled
+        
+    Returns:
+        dict with statistics
+    """
+    if rl_coords is None:
+        return {}
+    
+    B, num_points, _ = rl_coords.shape
+    _, _, H_mask, W_mask = prostate_mask.shape
+    
+    # CRITICAL FIX: Resize mask to match coordinate space (256x256)
+    COORD_SPACE_SIZE = 256
+    if H_mask != COORD_SPACE_SIZE or W_mask != COORD_SPACE_SIZE:
+        prostate_mask = torch.nn.functional.interpolate(
+            prostate_mask.float(),
+            size=(COORD_SPACE_SIZE, COORD_SPACE_SIZE),
+            mode='nearest'
+        )
+    
+    _, _, H, W = prostate_mask.shape
+    
+    total_inside = 0
+    total_outside = 0
+    
+    for i in range(B):
+        mask_i = prostate_mask[i, 0]
+        coords_i = rl_coords[i]
+        
+        for j in range(num_points):
+            x, y = coords_i[j]
+            px = int(torch.clamp(x, 0, W - 1).item())
+            py = int(torch.clamp(y, 0, H - 1).item())
+            
+            if mask_i[py, px] > 0.5:
+                total_inside += 1
+            else:
+                total_outside += 1
+    
+    total = total_inside + total_outside
+    pct_inside = 100.0 * total_inside / total if total > 0 else 0.0
+    
+    return {
+        'coords_inside_prostate_pct': pct_inside,
+        'coords_outside_prostate_pct': 100.0 - pct_inside,
+        'total_coords': total,
+    }
+
+
 def run_train_epoch(
     args, model, loader, criterion, optimizer, scheduler, scaler, epoch, desc="Train"
 ):
@@ -361,6 +416,15 @@ def run_rl_train_epoch(
                 # Compute reward for this rollout
                 reward = reward_computer(rollout_data, data)
                 all_rewards.append(reward)
+            
+            # Compute prostate boundary statistics for logging
+            if args.get('rl_prostate_boundary_penalty_weight', 0) > 0:
+                coords_stats = compute_coords_inside_prostate_stats(
+                    all_rollout_data[0]['rl_attention_coords'],
+                    data['prostate_mask'].to(args.device)
+                )
+            else:
+                coords_stats = {}
             
             # Stack all samples: shape becomes (B * num_samples_per_image,)
             # Interleaved: [img0_sample0, img0_sample1, ..., img1_sample0, img1_sample1, ...]
@@ -472,6 +536,11 @@ def run_rl_train_epoch(
         rewards_per_image = rewards.view(B, num_samples_per_image)
         within_image_std = rewards_per_image.std(dim=1).mean().item()
         step_metrics["train_rl/within_image_reward_std"] = within_image_std
+        
+        # Log prostate boundary statistics
+        if coords_stats:
+            for key, value in coords_stats.items():
+                step_metrics[f"train_rl/{key}"] = value
         
         # Log learning rates
         if hasattr(model, 'get_params_groups'):

@@ -1,5 +1,6 @@
 # ProstNFound-RL training configuration
 # This config adds RL-guided attention to ProstNFound+
+name: "prostnfound-rl-within-image-v4"  # Changed name for fresh run
 
 data:
   fold: 0
@@ -58,13 +59,17 @@ rl_value_coef: 0.5  # Value loss coefficient
 rl_max_grad_norm: 0.5  # Gradient clipping
 rl_gamma: 1.0  # Discount factor (1.0 = no discounting)
 
+# Prostate Boundary Penalty (Soft Punishment)
+# Penalizes attention coordinates outside the prostate segmentation
+# The penalty is soft and increases with distance from the boundary
+rl_prostate_boundary_penalty_weight: 0.4  # Weight of the penalty (0 = disabled, higher = stronger)
+rl_prostate_boundary_penalty_scale: 10.0  # How fast penalty increases with distance (higher = faster)
+
 # Within-Image Comparison (key improvement)
 # Instead of comparing performance across different images (which have different difficulty),
 # we sample multiple attention location configurations per image and compare within each image.
 # This allows fair comparison and helps the model learn which attention strategies work best.
 rl_num_samples_per_image: 4  # Number of rollouts per image (set to 1 to disable)
-
-name: "prostnfound-rl-within-image-v2"  # Changed name for fresh run
 
 # Optimizer configuration
 optimizer: adamw
@@ -95,7 +100,8 @@ torch_compile: false  # Disable for RL (can cause issues with dynamic graphs)
 use_amp: true
 device: cuda
 checkpoint_dir: checkpoints_rl_variations/${name} # New checkpoint directory for fresh run
-model_checkpoint: null  # No checkpoint - train from scratch
+# NOTE: The training script automatically resumes from experiment_state_rl.pth if it exists
+model_checkpoint: null  # This only loads model weights, not training state (epoch, optimizer, etc.)
 debug: false
 save_best_weights: true
 
