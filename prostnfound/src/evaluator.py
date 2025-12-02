@@ -60,9 +60,38 @@ def show_heatmap_prediction(data):
     ax[1].contour(needle_mask[0, 0], **kwargs)
     ax[1].contour(prostate_mask[0, 0], **kwargs)
 
-    fig.suptitle(
-        f"Ground truth label: Cancer {label[0].item() == 1}; Inv {data['involvement'][0].item():.2f}; Grade group {data['grade_group'][0]}"
-    )
+    # Build title with ground truth and model predictions
+    gt_cancer = label[0].item() == 1
+    involvement = data["involvement"][0].item()
+    grade_group = data["grade_group"][0]
+
+    # Heatmap-based prediction (needle average)
+    pred_heatmap = None
+    if "average_needle_heatmap_value" in data:
+        pred_heatmap = float(data["average_needle_heatmap_value"][0].item())
+
+    # Image-level classifier prediction (if available)
+    cls_prob = None
+    if "image_level_classification_outputs" in data:
+        cls_outputs = data["image_level_classification_outputs"][0].detach().cpu()
+        cls_probs = cls_outputs.softmax(-1)
+        # Assume binary classification, cancer is class 1
+        if cls_probs.ndim == 1:
+            cls_prob = float(cls_probs[1].item())
+        else:
+            cls_prob = float(cls_probs[0, 1].item())
+
+    title_parts = [
+        f"GT: Cancer {gt_cancer}",
+        f"Inv {involvement:.2f}",
+        f"Grade group {grade_group}",
+    ]
+    if pred_heatmap is not None:
+        title_parts.append(f"Heatmap p(cancer) {pred_heatmap:.2f}")
+    if cls_prob is not None:
+        title_parts.append(f"Image-level p(cancer) {cls_prob:.2f}")
+
+    fig.suptitle("; ".join(title_parts))
 
     return fig
 

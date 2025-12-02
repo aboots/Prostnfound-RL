@@ -114,6 +114,8 @@ def main(args):
     # For RL models, also accumulate attention point statistics
     if is_rl_model:
         rl_accumulator = defaultdict(list)
+        # For analysis: store per-core RL attention probabilities and coordinates
+        rl_attention_point_records = []
 
     loader = loaders[args.split]
 
@@ -180,35 +182,88 @@ def main(args):
                 )
             )
 
-        if args.save_rendered_heatmaps:
+        patient_id = data['patient_id'][0]
+        core_id = data['core_id'][0]
+    
+        output_file = os.path.join(
+            args.output_dir, 
+            "heatmaps", 
+            patient_id,
+            f"{core_id}.{args.save_format}"
+        )
+        os.makedirs(os.path.dirname(output_file), exist_ok=True)
 
-            patient_id = data['patient_id'][0]
-            core_id = data['core_id'][0]
+        show_heatmap_prediction(data)
         
-            output_file = os.path.join(
-                args.output_dir, 
-                "heatmaps", 
-                patient_id,
-                f"{core_id}.{args.save_format}"
-            )
-            os.makedirs(os.path.dirname(output_file), exist_ok=True)
-
-            show_heatmap_prediction(data)
+        # Overlay attention points and their probabilities if RL model
+        if is_rl_model and 'rl_attention_coords' in data:
+            coords = data['rl_attention_coords'][0].cpu().numpy()  # (k, 2) in [x, y]
             
-            # Overlay attention points if RL model
-            if is_rl_model and 'rl_attention_coords' in data:
-                coords = data['rl_attention_coords'][0].cpu().numpy()
-                plt.scatter(coords[:, 0], coords[:, 1], c='red', marker='x', 
-                           s=200, linewidths=3, label='RL Attention')
-                plt.legend()
+            # Default: just plot coordinates
+            xs = coords[:, 0]
+            ys = coords[:, 1]
+            plt.scatter(xs, ys, c='red', marker='x',
+                        s=200, linewidths=3, label='RL Attention')
             
-            plt.savefig(
-                output_file,
-                format=args.save_format,
-            )
-            plt.close()
+            point_probs = None
 
-        evaluator(data)
+            # If attention map is available, annotate probabilities from it
+            if 'rl_attention_map' in data and data['rl_attention_map'] is not None:
+                # rl_attention_map: typically (B, 1, H, W) or (B, H, W)
+                attn_map = data['rl_attention_map'][0].detach().cpu().numpy()
+                # Squeeze any singleton channel dimension
+                attn_map = np.squeeze(attn_map)
+                if attn_map.ndim != 2:
+                    raise ValueError(
+                        f"Expected attention map to be 2D after squeeze, got shape {attn_map.shape}"
+                    )
+                H, W = attn_map.shape
+
+                # RL coords are in image space [0, image_size]; map to attn_map indices
+                # We assume square image_size equal to max(H, W)
+                image_size = max(H, W)
+                scale_y = H / image_size
+                scale_x = W / image_size
+
+                point_probs = []
+                for x, y in coords:
+                    ix = int(np.clip(x * scale_x, 0, W - 1))
+                    iy = int(np.clip(y * scale_y, 0, H - 1))
+                    p = float(attn_map[iy, ix])
+                    point_probs.append(p)
+                    plt.text(
+                        x + 2, y + 2,
+                        f"{p:.2f}",
+                        color="yellow",
+                        fontsize=8,
+                        ha="left",
+                        va="bottom",
+                        bbox=dict(boxstyle="round,pad=0.2", fc="black", alpha=0.5),
+                    )
+
+            # Save probabilities for this core into a summary table (if we computed them)
+            if point_probs is not None:
+                for j, (x, y, p) in enumerate(zip(xs, ys, point_probs)):
+                    rl_attention_point_records.append(
+                        {
+                            "patient_id": patient_id,
+                            "core_id": core_id,
+                            "point_idx": j,
+                            "x": float(x),
+                            "y": float(y),
+                            "prob": float(p),
+                        }
+                    )
+            
+            plt.legend()
+        
+        plt.savefig(
+            output_file,
+            format=args.save_format,
+        )
+        plt.close()
+
+    evaluator(data)
 
     table = evaluator.accumulator.compute()
     table.to_csv(os.path.join(args.output_dir, "metrics_by_core.csv"))
@@ -234,6 +289,13 @@ def main(args):
             os.path.join(args.output_dir, "rl_attention_coords.npy"),
             all_coords.numpy()
         )
+
+        # Optionally save per-point attention probabilities and coordinates as CSV
+        if 'rl_attention_point_records' in locals() and len(rl_attention_point_records) > 0:
+            df_points = pd.DataFrame(rl_attention_point_records)
+            df_points.to_csv(
+                os.path.join(args.output_dir, "rl_attention_points.csv"), index=False
+            )
 
     print("\n=== Test Metrics ===")
     print(json.dumps(metrics, indent=4))

@@ -157,11 +157,13 @@ class ProstNFoundRL(nn.Module):
             clinical_features = torch.cat(clinical_list, dim=1)  # B x 4
         
         # Get attention points from policy
+        # CRITICAL: Pass prostate_mask to constrain sampling to valid regions only
         if self.policy_type == 'categorical':
             rl_coords, rl_log_probs, rl_attention_map, rl_value = self.policy(
                 image_feats,
                 clinical_features=clinical_features,
                 deterministic=deterministic,
+                prostate_mask=prostate_mask,  # Mask attention to prostate region
             )
         else:  # gaussian
             rl_coords, rl_log_probs, rl_value = self.policy(

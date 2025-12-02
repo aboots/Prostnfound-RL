@@ -1,6 +1,6 @@
 # ProstNFound-RL training configuration
 # This config adds RL-guided attention to ProstNFound+
-name: "prostnfound-rl-within-image-hard-masking"  # Changed name for fresh run
+name: "prostnfound-reward-rl"  # Changed name for fresh run
 
 data:
   fold: 0

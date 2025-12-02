@@ -88,6 +88,7 @@ class RLAttentionPolicy(nn.Module):
         image_features: torch.Tensor,
         clinical_features: Optional[torch.Tensor] = None,
         deterministic: bool = False,
+        prostate_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass to generate attention points.
@@ -96,6 +97,8 @@ class RLAttentionPolicy(nn.Module):
             image_features: Feature maps from encoder, shape (B, C, H, W)
             clinical_features: Optional clinical data, shape (B, num_features)
             deterministic: If True, select top-k points; if False, sample from distribution
+            prostate_mask: Optional prostate mask (B, 1, H_mask, W_mask) to constrain sampling
+                          If provided, attention is masked to only allow sampling inside prostate
             
         Returns:
             coords: Point coordinates in image space (B, k, 2) in range [0, image_size]
@@ -124,9 +127,32 @@ class RLAttentionPolicy(nn.Module):
         # Apply temperature
         attention_logits = attention_logits / self.temperature
         
+        # CRITICAL: Apply prostate mask to constrain sampling INSIDE prostate only
+        # This is much more effective than soft penalties because it prevents
+        # the model from ever sampling outside the prostate
+        if prostate_mask is not None:
+            # Resize prostate mask to match attention map spatial dimensions
+            prostate_mask_resized = F.interpolate(
+                prostate_mask.float(),
+                size=(H, W),
+                mode='nearest'
+            )  # B x 1 x H x W
+            
+            # Flatten mask
+            mask_flat = prostate_mask_resized.view(B, -1)  # B x (H*W)
+            
+            # Check for empty masks (would cause NaN in softmax)
+            # For samples with empty/invalid masks, don't apply masking
+            valid_mask_per_sample = (mask_flat > 0.5).any(dim=1, keepdim=True)  # B x 1
+            
+            # Only mask samples that have valid prostate regions
+            # For invalid samples, keep original logits (allow sampling anywhere)
+            mask_to_apply = (mask_flat < 0.5) & valid_mask_per_sample  # B x (H*W)
+            attention_logits = attention_logits.masked_fill(mask_to_apply, float('-inf'))
+        
         # Sample or select top-k points
         if deterministic:
-            # Select top-k points
+            # Select top-k points (from valid locations only due to masking)
             top_k_indices = torch.topk(attention_logits, k=self.num_attention_points, dim=1).indices
             coords_flat = top_k_indices  # B x k
             
@@ -134,14 +160,27 @@ class RLAttentionPolicy(nn.Module):
             log_probs = F.log_softmax(attention_logits, dim=1)
             selected_log_probs = torch.gather(log_probs, 1, coords_flat)  # B x k
         else:
-            # Sample from categorical distribution
+            # Sample from categorical distribution (masked to prostate region)
             attention_probs = F.softmax(attention_logits, dim=1)
+            
+            # CRITICAL: Handle NaN and invalid probability rows
+            # This happens when all logits are -inf (empty prostate mask)
+            for batch_idx in range(B):
+                row = attention_probs[batch_idx]
+                if torch.isnan(row).any() or row.sum() < 1e-6:
+                    # Replace with uniform distribution
+                    attention_probs[batch_idx] = torch.ones_like(row) / row.size(0)
             
             # Sample k points without replacement
             sampled_indices_list = []
             log_probs_list = []
             
             for i in range(self.num_attention_points):
+                # Ensure probs are valid before sampling
+                # Clamp to avoid numerical issues
+                attention_probs = torch.clamp(attention_probs, min=1e-8)
+                attention_probs = attention_probs / attention_probs.sum(dim=1, keepdim=True)
+                
                 # Sample one point
                 dist = torch.distributions.Categorical(probs=attention_probs)
                 sampled_idx = dist.sample()  # B
@@ -151,9 +190,8 @@ class RLAttentionPolicy(nn.Module):
                 log_probs_list.append(sampled_log_prob)
                 
                 # Zero out the probability of sampled points to avoid re-sampling
-                # (simple approximation of sampling without replacement)
-                attention_probs = attention_probs.scatter(1, sampled_idx.unsqueeze(1), 0.0)
-                attention_probs = attention_probs / (attention_probs.sum(dim=1, keepdim=True) + 1e-8)
+                attention_probs = attention_probs.scatter(1, sampled_idx.unsqueeze(1), 1e-8)
+                attention_probs = attention_probs / attention_probs.sum(dim=1, keepdim=True)
             
             coords_flat = torch.stack(sampled_indices_list, dim=1)  # B x k
             selected_log_probs = torch.stack(log_probs_list, dim=1)  # B x k
