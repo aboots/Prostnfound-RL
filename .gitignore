@@ -154,7 +154,6 @@ wandb/
 # *.mat
 
 # Large files
-*.pdf
 *.zip
 *.tar.gz
 *.rar
@@ -202,3 +201,4 @@ out.csv
 out_pirads.csv
 Seg-R1/
 submit.sh
+readMes/
