@@ -2,10 +2,17 @@
 Training script for ProstNFound-RL with GRPO
 
 This is a modified version of train.py that supports RL training with GRPO.
+
+Key Optimizations (v2):
+1. Batched forward passes: All samples computed in ONE forward pass
+2. Pure GRPO without value function (like Seg-R1)
+3. Group-based advantage normalization within each image
+4. Configurable prostate mask constraint
 """
 
 import argparse
 from collections import defaultdict
+import copy
 import json
 import logging
 import os
@@ -25,7 +32,7 @@ from einops import rearrange, repeat
 from matplotlib import pyplot as plt
 from medAI.modeling.prostnfound import ProstNFound
 from medAI.modeling.prostnfound_rl import ProstNFoundRL
-from medAI.modeling.grpo import GRPO, GRPOTrainer, create_grpo_optimizer
+from medAI.modeling.grpo import GRPO, BatchedGRPOTrainer, create_grpo_optimizer
 from medAI.modeling.setr import SETR
 from torch.nn import functional as F
 from tqdm import tqdm
@@ -57,18 +64,15 @@ OmegaConf.register_new_resolver('getenv', os.getenv)
 
 def main(cfg):
     # setup
-    # Create checkpoint directory first if it exists, so we can save logs there
     if cfg.checkpoint_dir is not None:
         os.makedirs(cfg.checkpoint_dir, exist_ok=True)
         log_file_path = os.path.join(cfg.checkpoint_dir, "log.txt")
     else:
         log_file_path = None
     
-    # Setup logging with both console and file handlers
     handlers = [logging.StreamHandler()]
     if log_file_path is not None:
-        # Add file handler to save logs to checkpoint directory
-        file_handler = logging.FileHandler(log_file_path, mode='a')  # Append mode
+        file_handler = logging.FileHandler(log_file_path, mode='a')
         file_handler.setLevel(logging.INFO if not cfg.debug else logging.DEBUG)
         handlers.append(file_handler)
     
@@ -77,7 +81,7 @@ def main(cfg):
         format="%(asctime)s %(levelname)s %(message)s",
         handlers=handlers,
     )
-    logging.info("Setting up RL experiment")
+    logging.info("Setting up RL experiment (v2 - optimized)")
     if log_file_path is not None:
         logging.info(f"Logging to file: {log_file_path}")
 
@@ -110,12 +114,10 @@ def main(cfg):
 
     logging.info("Setting up RL model")
 
-    # Create model
     model = create_model(cfg.model, **cfg.model_kw)
     print(f"Model: {type(model)}")
     print(f"Model kwargs: {cfg.model_kw}")
     
-    # Check if it's an RL model
     is_rl_model = isinstance(model, ProstNFoundRL)
     logging.info(f"Is RL model: {is_rl_model}")
     
@@ -131,7 +133,6 @@ def main(cfg):
         f"Number of trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}"
     )
     
-    # Load checkpoint if provided
     if cfg.model_checkpoint:
         model_state = torch.load(cfg.model_checkpoint, map_location="cpu")
         if "model" in model_state:
@@ -141,7 +142,6 @@ def main(cfg):
     if state is not None:
         model.load_state_dict(state["model"])
 
-    # setup criterion
     criterion = build_loss(cfg)
 
     loaders = get_dataloaders(cfg.data)
@@ -152,27 +152,24 @@ def main(cfg):
     # Setup RL components if enabled
     use_rl = cfg.get('use_rl', False)
     if use_rl and is_rl_model:
-        logging.info("Setting up RL training components")
+        logging.info("Setting up RL training components (v2 - optimized)")
         
-        # Number of samples per image for within-image comparison
         num_samples_per_image = cfg.get('rl_num_samples_per_image', 4)
-        logging.info(f"Using within-image comparison with {num_samples_per_image} samples per image")
+        logging.info(f"Using batched within-image comparison with {num_samples_per_image} samples per image")
         
-        # Create GRPO algorithm with within-image comparison support
+        # Create pure GRPO (no value function) like Seg-R1
         grpo = GRPO(
             clip_eps=cfg.get('rl_clip_eps', 0.2),
             entropy_coef=cfg.get('rl_entropy_coef', 0.01),
-            value_coef=cfg.get('rl_value_coef', 0.5),
+            kl_coef=cfg.get('rl_kl_coef', 0.01),
             max_grad_norm=cfg.get('rl_max_grad_norm', 0.5),
-            gamma=cfg.get('rl_gamma', 1.0),
             normalize_advantages=cfg.get('rl_normalize_advantages', True),
             num_samples_per_image=num_samples_per_image,
         )
         
-        # Create reward computer
         reward_computer = build_rl_reward_computer(cfg)
         
-        logging.info(f"RL mode: {cfg.get('rl_mode', 'grpo')}")
+        logging.info(f"RL mode: Pure GRPO (no value function)")
     else:
         grpo = None
         reward_computer = None
@@ -226,7 +223,7 @@ def main(cfg):
         save_checkpoint("experiment_state_rl.pth")
 
         if use_rl and is_rl_model:
-            run_rl_train_epoch(
+            run_rl_train_epoch_batched(
                 cfg,
                 model,
                 train_loader,
@@ -275,24 +272,49 @@ def main(cfg):
     logging.info("Finished RL training")
 
 
-def compute_coords_inside_prostate_stats(rl_coords, prostate_mask):
+def replicate_batch_for_sampling(data: dict, num_samples: int, device: str) -> dict:
     """
-    Compute statistics about how many RL attention coordinates are inside vs outside prostate.
+    Replicate batch for batched sampling (multiple samples per image).
+    
+    This allows running ONE forward pass instead of num_samples separate passes.
+    Creates a NEW dictionary to avoid modifying the original data.
     
     Args:
-        rl_coords: Attention coordinates (B, num_points, 2) in [x, y] format, in 256x256 space
-        prostate_mask: Prostate segmentation mask (B, 1, H, W), may be downsampled
+        data: Original batch with tensors of shape (B, ...)
+        num_samples: Number of times to replicate each sample
+        device: Device to move tensors to
         
     Returns:
-        dict with statistics
+        Replicated data with tensors of shape (B * num_samples, ...)
     """
+    replicated = {}
+    for key, value in data.items():
+        if isinstance(value, torch.Tensor):
+            # Creates a new tensor (no shared memory with original)
+            replicated[key] = value.repeat_interleave(num_samples, dim=0).to(device)
+        elif isinstance(value, list):
+            # Creates a new list
+            replicated[key] = [v for v in value for _ in range(num_samples)]
+        elif isinstance(value, (int, float, str, bool, type(None))):
+            # Immutable types can be shared safely
+            replicated[key] = value
+        else:
+            # For other types, try to copy if possible
+            try:
+                replicated[key] = copy.deepcopy(value)
+            except:
+                replicated[key] = value
+    return replicated
+
+
+def compute_coords_inside_prostate_stats(rl_coords, prostate_mask):
+    """Compute statistics about how many RL attention coordinates are inside vs outside prostate."""
     if rl_coords is None:
         return {}
     
     B, num_points, _ = rl_coords.shape
     _, _, H_mask, W_mask = prostate_mask.shape
     
-    # CRITICAL FIX: Resize mask to match coordinate space (256x256)
     COORD_SPACE_SIZE = 256
     if H_mask != COORD_SPACE_SIZE or W_mask != COORD_SPACE_SIZE:
         prostate_mask = torch.nn.functional.interpolate(
@@ -371,7 +393,6 @@ def run_train_epoch(
         step_metrics = {f"train/{k}": v for k, v in evaluator(data).items()}
         step_metrics.update({"train_loss": loss.item() * args.accumulate_grad_steps})
         
-        # Log learning rates
         if hasattr(model, 'get_params_groups'):
             encoder_lr = optimizer.param_groups[0]["lr"]
             main_lr = optimizer.param_groups[1]["lr"]
@@ -388,114 +409,85 @@ def run_train_epoch(
     wandb.log(metrics)
 
 
-def run_rl_train_epoch(
+def run_rl_train_epoch_batched(
     args, model, loader, criterion, optimizer, scheduler, scaler, grpo, reward_computer, epoch, desc="Train RL"
 ):
     """
-    RL training epoch with GRPO using Within-Image Comparison.
+    Optimized RL training epoch with BATCHED forward passes.
     
-    Key improvement: Instead of comparing different images (which have different difficulty),
-    we sample multiple rollouts (attention locations) per image and compare them within
-    each image. This allows the model to learn which attention strategies work better
-    for each specific image.
+    Key optimization: Instead of running num_samples_per_image separate forward passes,
+    we replicate the batch and run ONE batched forward pass.
+    
+    This is much faster on large GPUs.
     """
     model.train()
     evaluator = Evaluator(**args.evaluator)
     
-    # Number of samples (rollouts) per image for within-image comparison
     num_samples_per_image = args.get('rl_num_samples_per_image', 4)
+    num_rl_updates = args.get('rl_num_update_epochs', 4)
 
     for train_iter, data in enumerate(tqdm(loader, desc=desc)):
 
         if args.debug and train_iter > 10:
             break
 
-        # Step 1: Collect multiple rollouts per image for within-image comparison
-        # This is the key change: instead of one sample per image, we sample multiple
-        # attention location configurations and compare them within each image
+        B = data['bmode'].shape[0]
+        
+        # ============================================
+        # Step 1: BATCHED rollout collection
+        # Replicate batch and run ONE forward pass
+        # ============================================
         with torch.no_grad():
-            all_rollout_data = []
-            all_rewards = []
+            # Replicate batch for multiple samples per image
+            batched_data = replicate_batch_for_sampling(data, num_samples_per_image, args.device)
             
-            for sample_idx in range(num_samples_per_image):
-                # Sample from policy (non-deterministic)
-                rollout_data = model(data, deterministic=False)
-                
-                # Store rollout data
-                all_rollout_data.append({
-                    'rl_log_probs': rollout_data.get('rl_log_probs'),
-                    'rl_value': rollout_data.get('rl_value'),
-                    'rl_attention_coords': rollout_data.get('rl_attention_coords'),
-                    'cancer_logits': rollout_data.get('cancer_logits'),
-                })
-                
-                # Compute reward for this rollout
-                reward = reward_computer(rollout_data, data)
-                all_rewards.append(reward)
+            # Single batched forward pass (much faster!)
+            batched_outputs = model(batched_data, deterministic=False)
             
-            # Compute prostate boundary statistics for logging
-            if args.get('rl_prostate_boundary_penalty_weight', 0) > 0:
-                coords_stats = compute_coords_inside_prostate_stats(
-                    all_rollout_data[0]['rl_attention_coords'],
-                    data['prostate_mask'].to(args.device)
-                )
-            else:
-                coords_stats = {}
+            # Extract RL info
+            old_log_probs = batched_outputs.get('rl_log_probs').detach()  # (B * num_samples, k)
+            batched_coords = batched_outputs.get('rl_attention_coords')
             
-            # Stack all samples: shape becomes (B * num_samples_per_image,)
-            # Interleaved: [img0_sample0, img0_sample1, ..., img1_sample0, img1_sample1, ...]
-            B = data['bmode'].shape[0]
-            
-            # Concatenate log_probs: (B, k) -> (B * num_samples, k)
-            old_log_probs_list = [rd['rl_log_probs'] for rd in all_rollout_data]
-            old_log_probs = torch.stack(old_log_probs_list, dim=1).view(B * num_samples_per_image, -1)
-            
-            # Concatenate values: (B, 1) -> (B * num_samples, 1)
-            old_values_list = [rd['rl_value'] for rd in all_rollout_data]
-            old_values = torch.stack(old_values_list, dim=1).view(B * num_samples_per_image, -1)
-            
-            # Concatenate rewards: (B,) -> (B * num_samples,)
-            rewards = torch.stack(all_rewards, dim=1).view(B * num_samples_per_image)
-
-        # Step 2: GRPO updates with within-image advantage normalization
-        num_rl_updates = args.get('rl_num_update_epochs', 4)
+            # Compute rewards for all samples in one go
+            all_rewards = reward_computer(batched_outputs, batched_data)  # (B * num_samples,)
+        
+        # Compute prostate boundary statistics for logging (use first sample per image)
+        if args.get('rl_prostate_boundary_penalty_weight', 0) > 0:
+            # Reshape to get first sample per image
+            coords_first = batched_coords.view(B, num_samples_per_image, -1, 2)[:, 0]
+            coords_stats = compute_coords_inside_prostate_stats(
+                coords_first,
+                data['prostate_mask'].to(args.device)
+            )
+        else:
+            coords_stats = {}
+        
+        # ============================================
+        # Step 2: GRPO updates with batched forward
+        # ============================================
         rl_metrics_list = []
         
         for rl_epoch in range(num_rl_updates):
             with torch.amp.autocast('cuda', enabled=args.use_amp):
-                # Re-run model for each sample to get current policy
-                # We need to sample the same number of times
-                current_log_probs_list = []
-                current_values_list = []
+                # Batched forward for current policy (reuse replicated data)
+                current_outputs = model(batched_data, deterministic=False)
+                current_log_probs = current_outputs.get('rl_log_probs')  # (B * num_samples, k)
                 
-                for sample_idx in range(num_samples_per_image):
-                    current_data = model(data, deterministic=False)
-                    current_log_probs_list.append(current_data.get('rl_log_probs'))
-                    current_values_list.append(current_data.get('rl_value'))
+                # Supervised loss (use mean over samples for stable training)
+                supervised_loss = criterion(current_outputs)
                 
-                # Stack current samples
-                current_log_probs = torch.stack(current_log_probs_list, dim=1).view(B * num_samples_per_image, -1)
-                current_values = torch.stack(current_values_list, dim=1).view(B * num_samples_per_image, -1)
+                # RL loss (pure GRPO without value function)
+                rl_loss, rl_info = grpo.compute_loss(
+                    current_log_probs,
+                    old_log_probs,
+                    all_rewards.detach(),
+                    num_samples_per_image=num_samples_per_image,
+                )
                 
-                # Supervised loss (use last sample's data for supervised loss)
-                supervised_loss = criterion(current_data)
-                
-                # RL loss (GRPO) with within-image comparison
-                if old_log_probs is not None:
-                    rl_loss, rl_info = grpo.compute_loss(
-                        current_log_probs,
-                        old_log_probs.detach(),
-                        current_values,
-                        rewards.detach(),
-                        num_samples_per_image=num_samples_per_image,
-                    )
-                    
-                    # Combined loss
-                    total_loss = supervised_loss + rl_loss
-                    rl_metrics_list.append(rl_info)
-                else:
-                    total_loss = supervised_loss
-                    rl_info = {}
+                # Combined loss
+                rl_weight = args.get('rl_loss_weight', 1.0)
+                total_loss = supervised_loss + rl_weight * rl_loss
+                rl_metrics_list.append(rl_info)
 
             total_loss = total_loss / args.accumulate_grad_steps
             
@@ -506,7 +498,6 @@ def run_rl_train_epoch(
 
             if (train_iter + 1) % args.accumulate_grad_steps == 0:
                 if args.use_amp:
-                    # Gradient clipping
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(
                         model.parameters(),
@@ -525,8 +516,15 @@ def run_rl_train_epoch(
 
         scheduler.step()
 
-        # Evaluate and log
-        step_metrics = {f"train/{k}": v for k, v in evaluator(current_data).items()}
+        # ============================================
+        # Step 3: Logging
+        # ============================================
+        # Run a quick deterministic forward on original data for evaluation
+        # This ensures consistent batch size and clean evaluation metrics
+        with torch.no_grad():
+            eval_data = model(data, deterministic=True)
+        
+        step_metrics = {f"train/{k}": v for k, v in evaluator(eval_data).items()}
         step_metrics.update({
             "train_loss": supervised_loss.item(),
             "train_total_loss": total_loss.item() * args.accumulate_grad_steps,
@@ -539,17 +537,17 @@ def run_rl_train_epoch(
                 avg_rl_metrics[f"train_rl/{key}"] = np.mean([m[key] for m in rl_metrics_list])
             step_metrics.update(avg_rl_metrics)
         
-        # Add reward stats (now computed within-image)
+        # Add reward stats
         step_metrics.update({
-            "train_rl/reward_mean": rewards.mean().item(),
-            "train_rl/reward_std": rewards.std().item(),
-            "train_rl/reward_min": rewards.min().item(),
-            "train_rl/reward_max": rewards.max().item(),
+            "train_rl/reward_mean": all_rewards.mean().item(),
+            "train_rl/reward_std": all_rewards.std().item(),
+            "train_rl/reward_min": all_rewards.min().item(),
+            "train_rl/reward_max": all_rewards.max().item(),
             "train_rl/num_samples_per_image": num_samples_per_image,
         })
         
-        # Compute within-image reward variance (to monitor diversity)
-        rewards_per_image = rewards.view(B, num_samples_per_image)
+        # Compute within-image reward variance
+        rewards_per_image = all_rewards.view(B, num_samples_per_image)
         within_image_std = rewards_per_image.std(dim=1).mean().item()
         step_metrics["train_rl/within_image_reward_std"] = within_image_std
         
@@ -834,4 +832,3 @@ if __name__ == "__main__":
     cfg = OmegaConf.load(args.config)
 
     main(cfg)
-

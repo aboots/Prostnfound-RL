@@ -3,14 +3,20 @@ ProstNFound-RL: RL-Guided Attention for Prostate Cancer Detection
 
 This module extends ProstNFound with reinforcement learning-based attention
 to actively identify suspicious regions for improved cancer detection.
+
+Key Features (v2):
+- Toggle for prostate mask constraint (enable/disable)
+- Patch-based policy option (K patches instead of K points)
+- Removed value function (uses pure GRPO)
+- Better decoder prompting verification
 """
 
 import logging
 import torch
 import torch.nn as nn
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 from .prostnfound import ProstNFound
-from .rl_attention_policy import RLAttentionPolicy, RLAttentionPolicyGaussian
+from .rl_attention_policy import RLAttentionPolicy, RLAttentionPolicyGaussian, RLPatchPolicy
 from .registry import register_model, create_model
 
 
@@ -25,11 +31,14 @@ class ProstNFoundRL(nn.Module):
     Args:
         prostnfound_model: Base ProstNFound model
         num_attention_points: Number of attention points to generate (default: 3)
-        policy_type: Type of policy network ('categorical' or 'gaussian')
+        policy_type: Type of policy network ('categorical', 'gaussian', or 'patch')
         policy_hidden_dim: Hidden dimension for policy network (default: 512)
         use_clinical_in_policy: Whether to use clinical features in policy (default: True)
         freeze_prostnfound: Whether to freeze ProstNFound weights during RL training (default: False)
         temperature: Temperature for sampling (categorical policy only, default: 1.0)
+        use_prostate_mask_constraint: Whether to constrain attention to prostate region (default: True)
+            Set to False to see full image attention (useful for debugging/analysis)
+        points_per_patch: For patch policy, number of points per patch (default: 5)
     """
     
     def __init__(
@@ -41,6 +50,8 @@ class ProstNFoundRL(nn.Module):
         use_clinical_in_policy: bool = True,
         freeze_prostnfound: bool = False,
         temperature: float = 1.0,
+        use_prostate_mask_constraint: bool = True,
+        points_per_patch: int = 5,
     ):
         super().__init__()
         
@@ -49,6 +60,8 @@ class ProstNFoundRL(nn.Module):
         self.policy_type = policy_type
         self.use_clinical_in_policy = use_clinical_in_policy
         self.freeze_prostnfound = freeze_prostnfound
+        self.use_prostate_mask_constraint = use_prostate_mask_constraint
+        self.points_per_patch = points_per_patch
         
         # Freeze ProstNFound if requested
         if freeze_prostnfound:
@@ -56,20 +69,21 @@ class ProstNFoundRL(nn.Module):
             for param in self.prostnfound.parameters():
                 param.requires_grad = False
         
-        # Get feature dimension from encoder
-        # MedSAM encoder outputs 256-dimensional features
+        # Get feature dimension from encoder (MedSAM outputs 256-dim features)
         feature_dim = 256
         
-        # Create policy network
+        # Create policy network based on type
         if policy_type == 'categorical':
             self.policy = RLAttentionPolicy(
                 feature_dim=feature_dim,
                 hidden_dim=policy_hidden_dim,
                 num_attention_points=num_attention_points,
-                image_size=256,  # Standard image size
+                image_size=256,
                 use_clinical_features=use_clinical_in_policy,
                 temperature=temperature,
+                use_prostate_mask_constraint=use_prostate_mask_constraint,
             )
+            self._total_attention_points = num_attention_points
         elif policy_type == 'gaussian':
             self.policy = RLAttentionPolicyGaussian(
                 feature_dim=feature_dim,
@@ -78,11 +92,27 @@ class ProstNFoundRL(nn.Module):
                 image_size=256,
                 use_clinical_features=use_clinical_in_policy,
             )
+            self._total_attention_points = num_attention_points
+        elif policy_type == 'patch':
+            self.policy = RLPatchPolicy(
+                feature_dim=feature_dim,
+                hidden_dim=policy_hidden_dim,
+                num_patches=num_attention_points,
+                points_per_patch=points_per_patch,
+                image_size=256,
+                use_clinical_features=use_clinical_in_policy,
+                use_prostate_mask_constraint=use_prostate_mask_constraint,
+            )
+            # Total points = num_patches * points_per_patch
+            self._total_attention_points = num_attention_points * points_per_patch
         else:
-            raise ValueError(f"Unknown policy_type: {policy_type}. Must be 'categorical' or 'gaussian'")
+            raise ValueError(f"Unknown policy_type: {policy_type}. Must be 'categorical', 'gaussian', or 'patch'")
         
-        logging.info(f"Created ProstNFoundRL with {policy_type} policy, "
-                    f"{num_attention_points} attention points")
+        logging.info(
+            f"Created ProstNFoundRL with {policy_type} policy, "
+            f"{num_attention_points} attention points/patches, "
+            f"prostate_mask_constraint={use_prostate_mask_constraint}"
+        )
     
     @property
     def prompts(self):
@@ -125,13 +155,13 @@ class ProstNFoundRL(nn.Module):
                 - iou: IoU predictions (if applicable)
                 - rl_attention_coords: Coordinates of attention points (B, k, 2)
                 - rl_log_probs: Log probabilities of actions (B, k)
-                - rl_attention_map: Raw attention heatmap (B, 1, H, W)
-                - rl_value: State value estimates (B, 1)
+                - rl_attention_map: Raw attention heatmap/patches (B, 1, H, W) or (B, k, 4)
+                - rl_value: None (no value function)
         """
         output_mode = output_mode or self.prostnfound.output_mode
         B, C, H, W = image.shape
         
-        # Step 1: Extract features using frozen MedSAM encoder
+        # Step 1: Extract features using MedSAM encoder
         with torch.set_grad_enabled(not self.freeze_prostnfound):
             image_feats = self.prostnfound.medsam_model.image_encoder(image)
             image_feats = self.prostnfound.img_emb_dropout(image_feats)
@@ -142,7 +172,6 @@ class ProstNFoundRL(nn.Module):
         # Prepare clinical features for policy if needed
         clinical_features = None
         if self.use_clinical_in_policy:
-            # Collect clinical features (pad to 4 features)
             clinical_list = []
             for prompt_name in ['age', 'psa', 'approx_psa_density', 'base_apex_encoding']:
                 if prompt_name in prompts and prompts[prompt_name] is not None:
@@ -151,45 +180,52 @@ class ProstNFoundRL(nn.Module):
                         feat = feat[:, None]
                     clinical_list.append(feat)
                 else:
-                    # Use zeros as placeholder
                     clinical_list.append(torch.zeros(B, 1, device=image.device))
-            
             clinical_features = torch.cat(clinical_list, dim=1)  # B x 4
         
         # Get attention points from policy
-        # CRITICAL: Pass prostate_mask to constrain sampling to valid regions only
+        # Pass prostate_mask only if constraint is enabled
+        mask_for_policy = prostate_mask if self.use_prostate_mask_constraint else None
+        
         if self.policy_type == 'categorical':
-            rl_coords, rl_log_probs, rl_attention_map, rl_value = self.policy(
+            rl_coords, rl_log_probs, rl_attention_map, _ = self.policy(
                 image_feats,
                 clinical_features=clinical_features,
                 deterministic=deterministic,
-                prostate_mask=prostate_mask,  # Mask attention to prostate region
+                prostate_mask=mask_for_policy,
             )
-        else:  # gaussian
-            rl_coords, rl_log_probs, rl_value = self.policy(
+        elif self.policy_type == 'patch':
+            rl_coords, rl_log_probs, rl_patches, _ = self.policy(
                 image_feats,
                 clinical_features=clinical_features,
                 deterministic=deterministic,
+                prostate_mask=mask_for_policy,
+            )
+            rl_attention_map = rl_patches  # Store patches for visualization
+        else:  # gaussian
+            rl_coords, rl_log_probs, _ = self.policy(
+                image_feats,
+                clinical_features=clinical_features,
+                deterministic=deterministic,
+                prostate_mask=mask_for_policy,
             )
             rl_attention_map = None
         
         # Step 3: Encode attention points as sparse prompts using SAM's prompt encoder
-        # SAM expects point prompts as (coords, labels) where:
-        # - coords: (B, N, 2) in [x, y] format
-        # - labels: (B, N) where 1 = foreground point, 0 = background point
+        # SAM expects (coords, labels) where labels: 1=foreground, 0=background
+        num_points = rl_coords.shape[1]
+        point_labels = torch.ones(B, num_points, device=rl_coords.device)
         
-        # We'll use all points as foreground (suspicious regions)
-        point_labels = torch.ones(B, self.num_attention_points, device=rl_coords.device)
-        
-        # Encode the attention points
+        # CRITICAL: Verify decoder gets the attention points
+        # The _embed_points function encodes points into prompt embeddings
         attention_point_embeddings = self.prostnfound.medsam_model.prompt_encoder._embed_points(
             rl_coords,
             point_labels,
             pad=False,
-        )  # B x k x 256
+        )  # B x num_points x 256
         
         # Step 4: Continue with standard ProstNFound forward pass
-        # Process prostate mask prompt
+        # Process prostate mask prompt (separate from RL constraint)
         if self.prostnfound.use_prostate_mask_prompt:
             if (
                 prostate_mask is None
@@ -231,7 +267,8 @@ class ProstNFoundRL(nn.Module):
         
         sparse_embedding = sparse_embedding.repeat_interleave(len(image), 0)
         
-        # Add RL attention point embeddings to sparse embeddings
+        # CRITICAL: Add RL attention point embeddings to sparse embeddings
+        # This is how the decoder receives the RL policy's attention points
         sparse_embedding = torch.cat([sparse_embedding, attention_point_embeddings], dim=1)
         
         # Process clinical prompts
@@ -253,7 +290,6 @@ class ProstNFoundRL(nn.Module):
                         prompt_value
                     )
                 else:
-                    # Skip unknown prompts
                     continue
             
             prompt_embedding = prompt_embedding[:, None, :]
@@ -298,11 +334,11 @@ class ProstNFoundRL(nn.Module):
                 size=image_feats.shape[-2:],
             )
         
-        # Pass through mask decoder
+        # Pass through mask decoder with RL attention embeddings
         mask_logits, iou = self.prostnfound.medsam_model.mask_decoder.forward(
             image_feats,
             pe,
-            sparse_embedding,
+            sparse_embedding,  # Includes RL attention point embeddings!
             dense_embedding,
             multimask_output=False,
         )
@@ -313,12 +349,12 @@ class ProstNFoundRL(nn.Module):
             + self.prostnfound.bias[None, None, None, :]
         )
         
-        # Class decoder if available
+        # Class decoder if available (also gets RL attention embeddings)
         if self.prostnfound.class_decoder is not None:
             cls_outputs = self.prostnfound.class_decoder.forward(
                 image_feats,
                 pe,
-                sparse_embedding,
+                sparse_embedding,  # Includes RL attention point embeddings!
                 dense_embedding,
             )
         else:
@@ -343,15 +379,14 @@ class ProstNFoundRL(nn.Module):
                 output['rl_attention_coords'] = rl_coords
                 output['rl_log_probs'] = rl_log_probs
                 output['rl_attention_map'] = rl_attention_map
-                output['rl_value'] = rl_value
+                output['rl_value'] = None  # No value function
             else:
-                # Convert to dict if not already
                 output = {
                     'mask_logits': output,
                     'rl_attention_coords': rl_coords,
                     'rl_log_probs': rl_log_probs,
                     'rl_attention_map': rl_attention_map,
-                    'rl_value': rl_value,
+                    'rl_value': None,
                 }
         
         return output
@@ -366,16 +401,13 @@ class ProstNFoundRL(nn.Module):
         3. CNN parameters (from ProstNFound)
         """
         if self.freeze_prostnfound:
-            # Only policy parameters are trainable
             encoder_parameters = []
             warmup_parameters = list(self.policy.parameters())
             cnn_parameters = []
         else:
-            # Get ProstNFound param groups
             encoder_parameters, warmup_parameters, cnn_parameters = (
                 self.prostnfound.get_params_groups()
             )
-            # Add policy to warmup group
             warmup_parameters = list(warmup_parameters) + list(self.policy.parameters())
         
         return encoder_parameters, warmup_parameters, cnn_parameters
@@ -389,22 +421,10 @@ def create_prostnfound_rl(
     use_clinical_in_policy: bool = True,
     freeze_prostnfound: bool = False,
     temperature: float = 1.0,
+    use_prostate_mask_constraint: bool = True,
+    points_per_patch: int = 5,
 ) -> ProstNFoundRL:
-    """
-    Factory function to create ProstNFoundRL model.
-    
-    Args:
-        prostnfound_model: Base ProstNFound model
-        num_attention_points: Number of attention points (default: 3)
-        policy_type: 'categorical' or 'gaussian'
-        policy_hidden_dim: Hidden dimension for policy network
-        use_clinical_in_policy: Use clinical features in policy
-        freeze_prostnfound: Freeze base model weights
-        temperature: Sampling temperature
-        
-    Returns:
-        ProstNFoundRL model
-    """
+    """Factory function to create ProstNFoundRL model."""
     return ProstNFoundRL(
         prostnfound_model=prostnfound_model,
         num_attention_points=num_attention_points,
@@ -413,6 +433,8 @@ def create_prostnfound_rl(
         use_clinical_in_policy=use_clinical_in_policy,
         freeze_prostnfound=freeze_prostnfound,
         temperature=temperature,
+        use_prostate_mask_constraint=use_prostate_mask_constraint,
+        points_per_patch=points_per_patch,
     )
 
 
@@ -427,34 +449,34 @@ def prostnfound_rl_adapter_medsam(
     use_clinical_in_policy: bool = True,
     freeze_prostnfound: bool = False,
     temperature: float = 1.0,
+    use_prostate_mask_constraint: bool = True,
+    points_per_patch: int = 5,
     prostnfound_kw: dict = {},
     **kwargs,
 ):
     """
     ProstNFound-RL with adapter MedSAM backbone.
     
-    This creates a ProstNFound model with RL-guided attention.
-    
     Args:
         backbone: Backbone model name
         backbone_kw: Keyword arguments for backbone
         prompts: List of clinical prompts to use
-        num_attention_points: Number of RL attention points
-        policy_type: 'categorical' or 'gaussian'
+        num_attention_points: Number of RL attention points/patches
+        policy_type: 'categorical', 'gaussian', or 'patch'
         policy_hidden_dim: Hidden dimension for policy network
         use_clinical_in_policy: Use clinical features in policy
         freeze_prostnfound: Freeze base ProstNFound weights
         temperature: Sampling temperature for policy
+        use_prostate_mask_constraint: Constrain attention to prostate region
+        points_per_patch: For patch policy, points per patch
         prostnfound_kw: Additional kwargs for ProstNFound
         **kwargs: Additional kwargs
         
     Returns:
         ProstNFoundRL model
     """
-    # Import here to avoid circular dependency
     from . import prostnfound as pnf_module
     
-    # Create base ProstNFound model
     floating_point_prompts = []
     for prompt in prompts:
         if prompt in [
@@ -474,20 +496,15 @@ def prostnfound_rl_adapter_medsam(
         else: 
             raise ValueError(f"Unknown prompt {prompt}")
     
-    # Create backbone
     backbone_model = create_model(backbone, **backbone_kw)
-    
-    # Merge prostnfound_kw and kwargs (prostnfound_kw takes precedence)
     pnf_kwargs = {**kwargs, **prostnfound_kw}
     
-    # Create ProstNFound
     base_model = ProstNFound(
         backbone_model,
         floating_point_prompts=floating_point_prompts,
         **pnf_kwargs,
     )
     
-    # Wrap with RL
     model = ProstNFoundRL(
         prostnfound_model=base_model,
         num_attention_points=num_attention_points,
@@ -496,6 +513,8 @@ def prostnfound_rl_adapter_medsam(
         use_clinical_in_policy=use_clinical_in_policy,
         freeze_prostnfound=freeze_prostnfound,
         temperature=temperature,
+        use_prostate_mask_constraint=use_prostate_mask_constraint,
+        points_per_patch=points_per_patch,
     )
     
     return model
@@ -511,15 +530,15 @@ def prostnfound_rl_adapter_medsam_legacy(
     use_clinical_in_policy: bool = True,
     freeze_prostnfound: bool = False,
     temperature: float = 1.0,
+    use_prostate_mask_constraint: bool = True,
+    points_per_patch: int = 5,
     upsample: bool = False,
     use_class_decoder: bool = True,
     **kwargs,
 ):
     """
-    ProstNFound-RL with legacy adapter MedSAM backbone (256 resolution).
+    ProstNFound-RL with legacy adapter MedSAM backbone.
     Compatible with existing ProstNFound+ checkpoints.
-    
-    This follows the same pattern as prostnfound_adapter_medsam_legacy.
     """
     from . import sam
     
@@ -538,7 +557,8 @@ def prostnfound_rl_adapter_medsam_legacy(
         use_clinical_in_policy=use_clinical_in_policy,
         freeze_prostnfound=freeze_prostnfound,
         temperature=temperature,
+        use_prostate_mask_constraint=use_prostate_mask_constraint,
+        points_per_patch=points_per_patch,
         prostnfound_kw={'use_class_decoder': use_class_decoder},
         **kwargs,
     )
-

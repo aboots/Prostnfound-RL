@@ -1,6 +1,12 @@
-# ProstNFound-RL training configuration
-# This config adds RL-guided attention to ProstNFound+
-name: "prostnfound-reward-rl"  # Changed name for fresh run
+# ProstNFound-RL training configuration (v2 - optimized)
+# Key improvements:
+# 1. Batched forward passes (much faster training)
+# 2. Pure GRPO without value function (like Seg-R1)
+# 3. Configurable prostate mask constraint
+# 4. Patch-based policy option (K patches instead of K points)
+# 5. Improved reward: classification + ROI involvement
+
+name: "prostnfound-rl-reward-new"
 
 data:
   fold: 0
@@ -11,7 +17,7 @@ data:
   undersample_benign_ratio: null
   cohort_selection_mode: kfold
   dataset: default
-  batch_size: 8
+  batch_size: 64  # Can increase with batched forward (try 16 on large GPU)
   num_workers: 8
   train_subsample_seed: 42
   augmentations: translate
@@ -33,12 +39,16 @@ model_kw:
   prompts: [psa,age]
   use_class_decoder: true
   # RL-specific parameters
-  num_attention_points: 3  # Number of attention points to identify
-  policy_type: categorical  # 'categorical' or 'gaussian'
+  num_attention_points: 3  # Number of attention points/patches
+  policy_type: patch  # 'categorical', 'gaussian', or 'patch'
   policy_hidden_dim: 512
   use_clinical_in_policy: true
   freeze_prostnfound: false  # Set to true to only train RL policy
   temperature: 1.0
+  # NEW: Prostate mask constraint toggle
+  use_prostate_mask_constraint: true  # Set to false to see whole image attention
+  # For patch policy only:
+  points_per_patch: 5  # Number of points sampled from each patch
 
 # Loss configuration
 loss: mil_prop_bce_entropy_reg
@@ -48,53 +58,50 @@ image_clf_mode: cspca
 
 # RL-specific training parameters
 use_rl: true  # Enable RL training mode
-rl_mode: grpo  # RL algorithm (grpo, ppo, reinforce)
-rl_reward_mode: loss_based  # Reward computation mode:
-  # - 'confidence_based': Reward high confidence on correct predictions (RECOMMENDED)
-  # - 'ranking_based': Reward based on ranking quality (good for AUC optimization)
-  # - 'f1_based': F1-score based reward (good for imbalanced datasets)
-  # - 'accuracy_based': Binary accuracy (+1 correct, -1 incorrect)
-  # - 'loss_based': Negative BCE loss (not recommended, scales poorly)
-  # - 'combined': Mix of loss and accuracy (legacy)
-rl_cspca_bonus: 2.0  # Bonus multiplier for csPCa cases
-rl_normalize_rewards: true  # Only used when num_samples_per_image=1
-rl_num_update_epochs: 4  # Number of GRPO update epochs per batch
-rl_clip_eps: 0.2  # PPO clipping epsilon
-rl_entropy_coef: 0.01  # Entropy coefficient
-rl_value_coef: 0.5  # Value loss coefficient
-rl_max_grad_norm: 0.5  # Gradient clipping
-rl_gamma: 1.0  # Discount factor (1.0 = no discounting)
+rl_mode: grpo  # RL algorithm (pure GRPO without value function)
 
-# Prostate Constraint (HARD MASKING - much more effective than soft penalty!)
-# The RL policy now masks attention probabilities to ONLY allow sampling inside prostate
-# This guarantees coordinates are inside prostate - no need for soft penalty
-# Keeping soft penalty at 0 since hard masking is sufficient
-rl_prostate_boundary_penalty_weight: 0.0  # Disabled - using hard masking instead
-rl_prostate_boundary_penalty_scale: 15.0  # Not used when weight is 0
+# Reward Configuration (v2)
+rl_reward_mode: confidence_based  # NEW recommended mode
+  # Options:
+  # - 'combined_v2': Classification + ROI involvement (RECOMMENDED)
+  # - 'confidence_based': Reward high confidence on correct predictions
+  # - 'classification_only': Only classification head performance
+  # - 'roi_only': Only ROI/heatmap involvement accuracy
+  # - 'loss_based': Negative BCE loss (legacy, not recommended)
+rl_cspca_bonus: 1.5  # Bonus multiplier for csPCa cases
 
-# Reward Composition (CRITICAL FIX for gradient flow)
-# RL policy affects BOTH heatmap decoder AND classification head
-# Need to reward improvements in BOTH to get proper learning signal
-rl_heatmap_reward_weight: 0.7  # Weight for heatmap performance (primary signal)
-rl_classification_reward_weight: 0.3  # Weight for classification performance (helps stabilize)
+# Reward Composition Weights (for combined_v2 mode)
+rl_heatmap_reward_weight: 0.5  # Weight for ROI involvement reward
+rl_classification_reward_weight: 0.5  # Weight for classification reward
 
 # Within-Image Comparison (key improvement)
-# Instead of comparing performance across different images (which have different difficulty),
-# we sample multiple attention location configurations per image and compare within each image.
-# This allows fair comparison and helps the model learn which attention strategies work best.
-rl_num_samples_per_image: 4  # Number of rollouts per image (set to 1 to disable)
+# Sample multiple attention configurations per image and compare within each image
+rl_num_samples_per_image: 8  # Number of rollouts per image
+
+# GRPO Hyperparameters (v2 - no value function)
+rl_num_update_epochs: 4  # Number of GRPO update epochs per batch
+rl_clip_eps: 0.2  # PPO clipping epsilon
+rl_entropy_coef: 0.01  # Entropy coefficient for exploration
+rl_kl_coef: 0.01 # KL penalty coefficient (like Seg-R1's beta)
+rl_max_grad_norm: 0.5  # Gradient clipping
+rl_loss_weight: 1.0  # Weight for RL loss vs supervised loss
+
+# Prostate Boundary Penalty (optional, disabled by default since hard masking is better)
+rl_prostate_boundary_penalty_weight: 0.0  # Set > 0 to enable soft penalty
+rl_prostate_boundary_penalty_scale: 10.0  # Scale factor for distance-based penalty
 
 # Optimizer configuration
 optimizer: adamw
-lr: 1.0e-05
+lr: 1.0e-04
 encoder_lr: 1.0e-05  # Lower LR for encoder (or 0 if frozen)
 warmup_lr: 0.0001
 cnn_lr: 1.0e-05
 warmup_epochs: 0
 wd: 0
-epochs: 30
+epochs: 16
 accumulate_grad_steps: 1
 cutoff_epoch: null
+scheduler: cosine  # 'cosine' or 'constant'
 
 run_test: false
 test_every_epoch: false
@@ -105,20 +112,17 @@ seed: 30
 tracked_metric: val/core_auc_high_involvement
 
 wandb:
-  mode: online  # Set to "online" to sync to wandb.ai (requires authentication)
-  # mode: offline  # Set to "offline" to save locally only
+  mode: online  # Set to "offline" to save locally only
 
 save_checkpoint_wandb: false
 torch_compile: false  # Disable for RL (can cause issues with dynamic graphs)
 use_amp: true
 device: cuda
-checkpoint_dir: checkpoints_rl_variations/${name} # New checkpoint directory for fresh run
-# NOTE: The training script automatically resumes from experiment_state_rl.pth if it exists
-model_checkpoint: null  # This only loads model weights, not training state (epoch, optimizer, etc.)
+checkpoint_dir: checkpoints_rl_variations/${name}
+model_checkpoint: null  # Load pretrained weights (not training state)
 debug: false
 save_best_weights: true
 
 evaluator:
   log_images: false
   log_images_every: 100
-
