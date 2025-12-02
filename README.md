@@ -315,19 +315,7 @@ prostnfound/
 If you use this code, please cite:
 
 ```bibtex
-@inproceedings{prostnfound2024,
-  title={ProstNFound: Integrating Foundation Models with Ultrasound Domain Knowledge and Clinical Context for Robust Prostate Cancer Detection},
-  author={Wilson et al.},
-  booktitle={MICCAI},
-  year={2024}
-}
 
-@article{prostnfound_rl2025,
-  title={ProstNFound-RL: Guided Attention with Reinforcement Learning for Robust Prostate Cancer Detection},
-  author={Abootorabi, Mohammad Mahdi},
-  journal={EECE 571S Project},
-  year={2025}
-}
 ```
 
 ## Future Work
