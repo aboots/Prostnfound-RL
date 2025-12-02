@@ -1,6 +1,6 @@
 # ProstNFound-RL training configuration
 # This config adds RL-guided attention to ProstNFound+
-name: "prostnfound-rl-within-image-v4"  # Changed name for fresh run
+name: "prostnfound-rl-within-image-hard-masking"  # Changed name for fresh run
 
 data:
   fold: 0
@@ -49,7 +49,13 @@ image_clf_mode: cspca
 # RL-specific training parameters
 use_rl: true  # Enable RL training mode
 rl_mode: grpo  # RL algorithm (grpo, ppo, reinforce)
-rl_reward_mode: loss_based  # 'loss_based', 'accuracy_based', or 'combined'
+rl_reward_mode: loss_based  # Reward computation mode:
+  # - 'confidence_based': Reward high confidence on correct predictions (RECOMMENDED)
+  # - 'ranking_based': Reward based on ranking quality (good for AUC optimization)
+  # - 'f1_based': F1-score based reward (good for imbalanced datasets)
+  # - 'accuracy_based': Binary accuracy (+1 correct, -1 incorrect)
+  # - 'loss_based': Negative BCE loss (not recommended, scales poorly)
+  # - 'combined': Mix of loss and accuracy (legacy)
 rl_cspca_bonus: 2.0  # Bonus multiplier for csPCa cases
 rl_normalize_rewards: true  # Only used when num_samples_per_image=1
 rl_num_update_epochs: 4  # Number of GRPO update epochs per batch
@@ -59,11 +65,18 @@ rl_value_coef: 0.5  # Value loss coefficient
 rl_max_grad_norm: 0.5  # Gradient clipping
 rl_gamma: 1.0  # Discount factor (1.0 = no discounting)
 
-# Prostate Boundary Penalty (Soft Punishment)
-# Penalizes attention coordinates outside the prostate segmentation
-# The penalty is soft and increases with distance from the boundary
-rl_prostate_boundary_penalty_weight: 0.4  # Weight of the penalty (0 = disabled, higher = stronger)
-rl_prostate_boundary_penalty_scale: 10.0  # How fast penalty increases with distance (higher = faster)
+# Prostate Constraint (HARD MASKING - much more effective than soft penalty!)
+# The RL policy now masks attention probabilities to ONLY allow sampling inside prostate
+# This guarantees coordinates are inside prostate - no need for soft penalty
+# Keeping soft penalty at 0 since hard masking is sufficient
+rl_prostate_boundary_penalty_weight: 0.0  # Disabled - using hard masking instead
+rl_prostate_boundary_penalty_scale: 15.0  # Not used when weight is 0
+
+# Reward Composition (CRITICAL FIX for gradient flow)
+# RL policy affects BOTH heatmap decoder AND classification head
+# Need to reward improvements in BOTH to get proper learning signal
+rl_heatmap_reward_weight: 0.7  # Weight for heatmap performance (primary signal)
+rl_classification_reward_weight: 0.3  # Weight for classification performance (helps stabilize)
 
 # Within-Image Comparison (key improvement)
 # Instead of comparing performance across different images (which have different difficulty),
@@ -79,7 +92,7 @@ warmup_lr: 0.0001
 cnn_lr: 1.0e-05
 warmup_epochs: 0
 wd: 0
-epochs: 20
+epochs: 30
 accumulate_grad_steps: 1
 cutoff_epoch: null
 

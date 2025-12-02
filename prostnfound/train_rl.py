@@ -57,12 +57,29 @@ OmegaConf.register_new_resolver('getenv', os.getenv)
 
 def main(cfg):
     # setup
+    # Create checkpoint directory first if it exists, so we can save logs there
+    if cfg.checkpoint_dir is not None:
+        os.makedirs(cfg.checkpoint_dir, exist_ok=True)
+        log_file_path = os.path.join(cfg.checkpoint_dir, "log.txt")
+    else:
+        log_file_path = None
+    
+    # Setup logging with both console and file handlers
+    handlers = [logging.StreamHandler()]
+    if log_file_path is not None:
+        # Add file handler to save logs to checkpoint directory
+        file_handler = logging.FileHandler(log_file_path, mode='a')  # Append mode
+        file_handler.setLevel(logging.INFO if not cfg.debug else logging.DEBUG)
+        handlers.append(file_handler)
+    
     logging.basicConfig(
         level=logging.INFO if not cfg.debug else logging.DEBUG,
         format="%(asctime)s %(levelname)s %(message)s",
-        handlers=[logging.StreamHandler()],
+        handlers=handlers,
     )
     logging.info("Setting up RL experiment")
+    if log_file_path is not None:
+        logging.info(f"Logging to file: {log_file_path}")
 
     if cfg.debug:
         cfg.name = "debug_rl"
@@ -79,7 +96,6 @@ def main(cfg):
     cfg.wandb_url = wandb.run.url if wandb.run else None
 
     if cfg.checkpoint_dir is not None:
-        os.makedirs(cfg.checkpoint_dir, exist_ok=True)
         exp_state_path = os.path.join(cfg.checkpoint_dir, "experiment_state_rl.pth")
         if os.path.exists(exp_state_path):
             logging.info("Loading experiment state from experiment_state_rl.pth")

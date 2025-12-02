@@ -19,13 +19,24 @@ class RLRewardComputer:
     Computes rewards for RL training based on cancer detection performance.
     
     The reward function is designed to:
-    1. Encourage correct cancer detection
-    2. Heavily reward correct identification of clinically significant PCa (csPCa)
-    3. Penalize false positives and false negatives
-    4. Softly penalize attention coordinates outside the prostate segmentation
+    1. Encourage correct cancer detection (heatmap)
+    2. Reward good classification performance (image-level)
+    3. Heavily reward correct identification of clinically significant PCa (csPCa)
+    4. Penalize false positives and false negatives
+    5. Softly penalize attention coordinates outside the prostate segmentation
+    
+    CRITICAL: The RL policy affects BOTH the decoder (heatmap) AND the classifier
+    through attention point embeddings. Therefore, the reward MUST include both
+    heatmap and classification performance to provide proper learning signal.
     
     Args:
-        reward_mode: Type of reward computation ('loss_based', 'accuracy_based', or 'combined')
+        reward_mode: Type of reward computation:
+            - 'loss_based': Negative BCE loss (current, not recommended)
+            - 'accuracy_based': Binary accuracy (+1 correct, -1 incorrect)
+            - 'confidence_based': Reward high confidence on correct predictions (RECOMMENDED)
+            - 'ranking_based': Reward based on ranking quality within batch
+            - 'f1_based': F1-score based reward
+            - 'combined': Mix of loss and accuracy (legacy)
         cspca_bonus: Bonus multiplier for csPCa cases (default: 2.0)
         normalize_rewards: Whether to normalize rewards within batch (default: False)
             NOTE: When using within-image comparison in GRPO, set this to False
@@ -33,6 +44,8 @@ class RLRewardComputer:
         prostate_boundary_penalty_weight: Weight for penalizing coordinates outside prostate (default: 0.1)
         prostate_boundary_penalty_scale: Scale factor for distance-based penalty (default: 10.0)
             Higher values make penalty increase faster with distance
+        heatmap_reward_weight: Weight for heatmap performance in combined reward (default: 0.7)
+        classification_reward_weight: Weight for classification performance (default: 0.3)
     """
     
     def __init__(
@@ -42,12 +55,16 @@ class RLRewardComputer:
         normalize_rewards: bool = False,  # Changed default to False for within-image comparison
         prostate_boundary_penalty_weight: float = 0.1,
         prostate_boundary_penalty_scale: float = 10.0,
+        heatmap_reward_weight: float = 0.7,
+        classification_reward_weight: float = 0.3,
     ):
         self.reward_mode = reward_mode
         self.cspca_bonus = cspca_bonus
         self.normalize_rewards = normalize_rewards
         self.prostate_boundary_penalty_weight = prostate_boundary_penalty_weight
         self.prostate_boundary_penalty_scale = prostate_boundary_penalty_scale
+        self.heatmap_reward_weight = heatmap_reward_weight
+        self.classification_reward_weight = classification_reward_weight
     
     def compute_prostate_boundary_penalty(
         self,
@@ -302,6 +319,306 @@ class RLRewardComputer:
         
         return rewards
     
+    def compute_confidence_based_reward(
+        self,
+        cancer_logits: torch.Tensor,
+        data: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Compute reward based on confidence calibration.
+        
+        This rewards:
+        - High confidence (probability close to 1) for positive cases
+        - Low confidence (probability close to 0) for negative cases
+        - Penalizes overconfidence on wrong predictions
+        
+        This is better than loss-based because:
+        1. Directly optimizes what we care about (confidence calibration)
+        2. More interpretable rewards
+        3. Better learning signal for ranking tasks
+        
+        Args:
+            cancer_logits: Predicted cancer logits (B, 1, H, W)
+            data: Batch data containing labels and masks
+            
+        Returns:
+            rewards: Reward for each sample (B,)
+        """
+        B = cancer_logits.shape[0]
+        device = cancer_logits.device
+        
+        prostate_mask = data['prostate_mask'].to(device)
+        needle_mask = data['needle_mask'].to(device)
+        involvement = data['involvement'].to(device)
+        
+        rewards = []
+        for i in range(B):
+            # Get mask for valid region
+            mask = torch.ones(prostate_mask[i].shape, device=device).bool()
+            mask &= prostate_mask[i] > 0.5
+            mask &= needle_mask[i] > 0.5
+            
+            # Get predictions in valid region
+            predictions, _ = MaskedPredictionModule()(
+                cancer_logits[i:i+1], mask[None, ...]
+            )
+            
+            if len(predictions) == 0:
+                rewards.append(0.0)
+                continue
+            
+            # Get mean prediction probability
+            pred_prob = predictions.sigmoid().mean()
+            target = involvement[i].item()
+            
+            # Confidence-based reward:
+            # - For positive cases: reward = pred_prob (higher is better)
+            # - For negative cases: reward = 1 - pred_prob (lower pred_prob is better)
+            if target > 0.5:
+                # Positive case: reward high confidence
+                reward = pred_prob.item()
+            else:
+                # Negative case: reward low confidence
+                reward = (1.0 - pred_prob).item()
+            
+            # Scale to [-1, 1] range: 2 * reward - 1
+            reward = 2.0 * reward - 1.0
+            
+            rewards.append(reward)
+        
+        rewards = torch.tensor(rewards, device=device)
+        
+        # Add csPCa bonus
+        if 'grade_group' in data:
+            cspca_mask = data['grade_group'] > 2
+            rewards[cspca_mask] *= self.cspca_bonus
+        
+        return rewards
+    
+    def compute_ranking_based_reward(
+        self,
+        cancer_logits: torch.Tensor,
+        data: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Compute reward based on ranking quality.
+        
+        This rewards samples that rank higher than other samples in the batch.
+        For positive cases: higher rank = higher reward
+        For negative cases: lower rank = higher reward
+        
+        This approximates AUC optimization and is better for ranking tasks.
+        
+        Args:
+            cancer_logits: Predicted cancer logits (B, 1, H, W)
+            data: Batch data containing labels and masks
+            
+        Returns:
+            rewards: Reward for each sample (B,)
+        """
+        B = cancer_logits.shape[0]
+        device = cancer_logits.device
+        
+        prostate_mask = data['prostate_mask'].to(device)
+        needle_mask = data['needle_mask'].to(device)
+        involvement = data['involvement'].to(device)
+        
+        # Get predictions for all samples
+        sample_scores = []
+        labels = []
+        
+        for i in range(B):
+            # Get mask for valid region
+            mask = torch.ones(prostate_mask[i].shape, device=device).bool()
+            mask &= prostate_mask[i] > 0.5
+            mask &= needle_mask[i] > 0.5
+            
+            # Get predictions in valid region
+            predictions, _ = MaskedPredictionModule()(
+                cancer_logits[i:i+1], mask[None, ...]
+            )
+            
+            if len(predictions) == 0:
+                sample_scores.append(0.0)
+            else:
+                pred_prob = predictions.sigmoid().mean().item()
+                sample_scores.append(pred_prob)
+            
+            labels.append(involvement[i].item())
+        
+        sample_scores = torch.tensor(sample_scores, device=device)
+        labels = torch.tensor(labels, device=device)
+        
+        # Compute ranking-based rewards
+        rewards = torch.zeros(B, device=device)
+        
+        # For each positive sample, reward based on how many negatives it ranks above
+        pos_mask = labels > 0.5
+        neg_mask = labels <= 0.5
+        
+        if pos_mask.sum() > 0 and neg_mask.sum() > 0:
+            pos_scores = sample_scores[pos_mask]
+            neg_scores = sample_scores[neg_mask]
+            
+            # For each positive: count how many negatives it beats
+            for i in range(B):
+                if labels[i] > 0.5:
+                    # Positive case: reward = fraction of negatives ranked below
+                    beats_negatives = (neg_scores < sample_scores[i]).float().mean()
+                    rewards[i] = beats_negatives * 2.0 - 1.0  # Scale to [-1, 1]
+                else:
+                    # Negative case: reward = fraction of positives ranked above
+                    beaten_by_positives = (pos_scores > sample_scores[i]).float().mean()
+                    rewards[i] = (1.0 - beaten_by_positives) * 2.0 - 1.0  # Scale to [-1, 1]
+        else:
+            # Fallback to confidence-based if no positive/negative mix
+            rewards = self.compute_confidence_based_reward(cancer_logits, data)
+        
+        # Add csPCa bonus
+        if 'grade_group' in data:
+            cspca_mask = data['grade_group'] > 2
+            rewards[cspca_mask] *= self.cspca_bonus
+        
+        return rewards
+    
+    def compute_f1_based_reward(
+        self,
+        cancer_logits: torch.Tensor,
+        data: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Compute reward based on F1-score approximation.
+        
+        This rewards both precision and recall, which is better for imbalanced datasets.
+        However, F1 requires batch-level computation, so we approximate per-sample.
+        
+        Args:
+            cancer_logits: Predicted cancer logits (B, 1, H, W)
+            data: Batch data containing labels and masks
+            
+        Returns:
+            rewards: Reward for each sample (B,)
+        """
+        B = cancer_logits.shape[0]
+        device = cancer_logits.device
+        
+        prostate_mask = data['prostate_mask'].to(device)
+        needle_mask = data['needle_mask'].to(device)
+        involvement = data['involvement'].to(device)
+        
+        # Get predictions and labels
+        predictions_list = []
+        labels_list = []
+        
+        for i in range(B):
+            mask = torch.ones(prostate_mask[i].shape, device=device).bool()
+            mask &= prostate_mask[i] > 0.5
+            mask &= needle_mask[i] > 0.5
+            
+            predictions, _ = MaskedPredictionModule()(
+                cancer_logits[i:i+1], mask[None, ...]
+            )
+            
+            if len(predictions) == 0:
+                pred_prob = 0.5  # Neutral prediction
+            else:
+                pred_prob = predictions.sigmoid().mean().item()
+            
+            predictions_list.append(pred_prob)
+            labels_list.append(involvement[i].item())
+        
+        predictions_tensor = torch.tensor(predictions_list, device=device)
+        labels_tensor = torch.tensor(labels_list, device=device)
+        
+        # Compute F1 components at batch level
+        pred_binary = (predictions_tensor > 0.5).float()
+        
+        # True positives, false positives, false negatives
+        tp = ((pred_binary == 1) & (labels_tensor > 0.5)).float().sum()
+        fp = ((pred_binary == 1) & (labels_tensor <= 0.5)).float().sum()
+        fn = ((pred_binary == 0) & (labels_tensor > 0.5)).float().sum()
+        
+        # Compute precision and recall
+        precision = tp / (tp + fp + 1e-8)
+        recall = tp / (tp + fn + 1e-8)
+        f1 = 2 * precision * recall / (precision + recall + 1e-8)
+        
+        # Per-sample reward: base reward + contribution to F1
+        rewards = torch.zeros(B, device=device)
+        
+        for i in range(B):
+            if labels_tensor[i] > 0.5:
+                # Positive case: reward based on recall contribution
+                if pred_binary[i] > 0.5:
+                    # True positive: contributes to recall
+                    reward = recall.item()
+                else:
+                    # False negative: hurts recall
+                    reward = -recall.item()
+            else:
+                # Negative case: reward based on precision contribution
+                if pred_binary[i] > 0.5:
+                    # False positive: hurts precision
+                    reward = -precision.item()
+                else:
+                    # True negative: contributes to precision
+                    reward = precision.item()
+            
+            # Scale by F1 score (overall quality)
+            rewards[i] = reward * f1.item()
+        
+        # Normalize to [-1, 1]
+        if rewards.std() > 1e-8:
+            rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+            rewards = torch.clamp(rewards, -1.0, 1.0)
+        
+        # Add csPCa bonus
+        if 'grade_group' in data:
+            cspca_mask = data['grade_group'] > 2
+            rewards[cspca_mask] *= self.cspca_bonus
+        
+        return rewards
+    
+    def compute_classification_reward(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        data: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Compute reward based on classification head performance.
+        
+        This is crucial because the RL policy affects BOTH the decoder (heatmap)
+        and the classifier through attention points. We need to reward good
+        classification performance too.
+        
+        Args:
+            outputs: Model outputs with classification logits
+            data: Batch data with labels
+            
+        Returns:
+            rewards: Classification rewards (B,)
+        """
+        cls_logits = outputs['image_level_classification_outputs'][0]  # (B, num_classes)
+        device = cls_logits.device
+        
+        # Get labels based on classification mode
+        if 'grade_group' in data:
+            # csPCa classification (grade_group > 2)
+            labels = (data['grade_group'] > 2).long().to(device)
+        else:
+            # Binary cancer classification
+            labels = data['label'].to(device)
+        
+        # Compute probabilities
+        probs = F.softmax(cls_logits, dim=1)
+        pred_probs = probs[torch.arange(len(labels)), labels]  # Probability of correct class
+        
+        # Reward: log probability of correct class (negative cross-entropy)
+        # Scale to similar range as heatmap rewards
+        rewards = torch.log(pred_probs + 1e-8) / 2.0  # Scale to roughly [-2, 0]
+        
+        return rewards
+    
     def __call__(
         self,
         outputs: Dict[str, torch.Tensor],
@@ -323,17 +640,36 @@ class RLRewardComputer:
         if cancer_logits is None:
             raise KeyError("Could not find 'cancer_logits' or 'mask_logits' in outputs")
         
-        # Compute base reward
+        # Compute base reward from heatmap (decoder output)
         if self.reward_mode == 'loss_based':
             rewards = self.compute_loss_based_reward(cancer_logits, data)
         elif self.reward_mode == 'accuracy_based':
             rewards = self.compute_accuracy_based_reward(cancer_logits, data)
+        elif self.reward_mode == 'confidence_based':
+            rewards = self.compute_confidence_based_reward(cancer_logits, data)
+        elif self.reward_mode == 'ranking_based':
+            rewards = self.compute_ranking_based_reward(cancer_logits, data)
+        elif self.reward_mode == 'f1_based':
+            rewards = self.compute_f1_based_reward(cancer_logits, data)
         elif self.reward_mode == 'combined':
             loss_reward = self.compute_loss_based_reward(cancer_logits, data)
             acc_reward = self.compute_accuracy_based_reward(cancer_logits, data)
             rewards = 0.5 * loss_reward + 0.5 * acc_reward
         else:
-            raise ValueError(f"Unknown reward_mode: {self.reward_mode}")
+            raise ValueError(
+                f"Unknown reward_mode: {self.reward_mode}. "
+                f"Must be one of: 'loss_based', 'accuracy_based', 'confidence_based', "
+                f"'ranking_based', 'f1_based', 'combined'"
+            )
+        
+        # CRITICAL FIX: Add classification head reward
+        # The RL policy affects BOTH decoder and classifier through attention points
+        # So we need to reward improvements in BOTH outputs, not just the heatmap
+        if 'image_level_classification_outputs' in outputs:
+            cls_reward = self.compute_classification_reward(outputs, data)
+            # Combine heatmap and classification rewards (weighted average)
+            # This ensures RL policy gets signal from both heads
+            rewards = self.heatmap_reward_weight * rewards + self.classification_reward_weight * cls_reward
         
         # Apply soft penalty for coordinates outside prostate mask
         if 'rl_attention_coords' in outputs and self.prostate_boundary_penalty_weight > 0:
@@ -423,11 +759,17 @@ def build_rl_reward_computer(args) -> RLRewardComputer:
     prostate_boundary_penalty_weight = args.get('rl_prostate_boundary_penalty_weight', 0.1)
     prostate_boundary_penalty_scale = args.get('rl_prostate_boundary_penalty_scale', 10.0)
     
+    # Reward composition weights (how much to weight heatmap vs classification)
+    heatmap_reward_weight = args.get('rl_heatmap_reward_weight', 0.7)
+    classification_reward_weight = args.get('rl_classification_reward_weight', 0.3)
+    
     return RLRewardComputer(
         reward_mode=reward_mode,
         cspca_bonus=cspca_bonus,
         normalize_rewards=normalize_rewards,
         prostate_boundary_penalty_weight=prostate_boundary_penalty_weight,
         prostate_boundary_penalty_scale=prostate_boundary_penalty_scale,
+        heatmap_reward_weight=heatmap_reward_weight,
+        classification_reward_weight=classification_reward_weight,
     )
 
