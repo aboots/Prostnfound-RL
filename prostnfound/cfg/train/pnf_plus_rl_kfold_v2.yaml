@@ -7,7 +7,7 @@
 # 5. Improved reward: classification + ROI involvement
 
 
-name: "HardMask-GRPO-Categorical-CombinedLoss2"
+name: "HardMask-GRPO-patch-CombinedLoss"
 
 
 data:
@@ -19,7 +19,7 @@ data:
  undersample_benign_ratio: null
  cohort_selection_mode: kfold
  dataset: default
- batch_size: 16  # Can increase with batched forward (try 16 on large GPU)
+ batch_size: 8  # Can increase with batched forward (try 16 on large GPU)
  num_workers: 8
  train_subsample_seed: 42
  augmentations: translate
@@ -42,8 +42,8 @@ model_kw:
  prompts: [psa,age]
  use_class_decoder: true
  # RL-specific parameters
- num_attention_points: 4  # Number of attention points/patches
- policy_type: categorical  # 'categorical', 'gaussian', or 'patch'
+ num_attention_points: 3  # Number of attention points/patches
+ policy_type: patch  # 'categorical', 'gaussian', or 'patch'
  policy_hidden_dim: 512
  use_clinical_in_policy: true
  freeze_prostnfound: false  # Set to true to only train RL policy
@@ -51,7 +51,7 @@ model_kw:
  # NEW: Prostate mask constraint toggle
  use_prostate_mask_constraint: true  # Set to false to see whole image attention
  # For patch policy only:
- points_per_patch: 4  # Number of points sampled from each patch
+ points_per_patch: 2  # Number of points sampled from each patch
  # Architecture version: 'v1' for legacy (old checkpoints), 'v2' for new (deeper)
  policy_arch_version: v2
  # PPO mode: set to true to use value function (requires value head in policy)
@@ -71,7 +71,7 @@ rl_mode: grpo  # RL algorithm (pure GRPO without value function)
 
 
 # Reward Configuration (v2)
-rl_reward_mode: combined_v2  # NEW recommended mode
+rl_reward_mode: confidence_based  # NEW recommended mode
  # Options:
  # - 'combined_v2': Classification + ROI involvement (RECOMMENDED)
  # - 'confidence_based': Reward high confidence on correct predictions
@@ -117,7 +117,7 @@ warmup_lr: 0.00005
 cnn_lr: 1.0e-05
 warmup_epochs: 1
 wd: 0.01
-epochs: 16
+epochs: 20
 accumulate_grad_steps: 1
 cutoff_epoch: null
 scheduler: cosine  # 'cosine' or 'constant'
