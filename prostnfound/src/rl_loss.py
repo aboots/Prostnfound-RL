@@ -23,6 +23,7 @@ class RLRewardComputer:
     1. Reward good classification performance (image-level)
     2. Reward correct ROI involvement prediction (region awareness)
     3. Optionally penalize attention outside prostate
+    4. Optionally reward diversity between samples (prevents policy collapse)
     
     Reward Modes:
     - 'combined_v2': Classification + ROI involvement (RECOMMENDED)
@@ -37,6 +38,7 @@ class RLRewardComputer:
         prostate_boundary_penalty_weight: Weight for outside-prostate penalty (default: 0.0 to disable)
         heatmap_reward_weight: Weight for heatmap/ROI performance (default: 0.5)
         classification_reward_weight: Weight for classification performance (default: 0.5)
+        diversity_reward_weight: Weight for within-image diversity bonus (default: 0.0)
     """
     
     def __init__(
@@ -48,6 +50,7 @@ class RLRewardComputer:
         prostate_boundary_penalty_scale: float = 10.0,
         heatmap_reward_weight: float = 0.5,
         classification_reward_weight: float = 0.5,
+        diversity_reward_weight: float = 0.0,  # Diversity bonus (prevents policy collapse)
     ):
         self.reward_mode = reward_mode
         self.cspca_bonus = cspca_bonus
@@ -56,6 +59,7 @@ class RLRewardComputer:
         self.prostate_boundary_penalty_scale = prostate_boundary_penalty_scale
         self.heatmap_reward_weight = heatmap_reward_weight
         self.classification_reward_weight = classification_reward_weight
+        self.diversity_reward_weight = diversity_reward_weight
     
     def compute_roi_involvement_reward(
         self,
@@ -262,6 +266,71 @@ class RLRewardComputer:
         
         return rewards
     
+    def compute_diversity_reward(
+        self,
+        rl_coords: torch.Tensor,
+        num_samples_per_image: int,
+    ) -> torch.Tensor:
+        """
+        Compute diversity reward for attention coordinates within each image.
+        
+        This encourages the policy to explore different regions across samples,
+        preventing policy collapse where all samples converge to the same locations.
+        
+        The reward is based on the average pairwise distance between attention
+        points from different samples of the same image.
+        
+        Args:
+            rl_coords: Attention coordinates (B * num_samples, num_points, 2)
+            num_samples_per_image: Number of samples per image
+            
+        Returns:
+            diversity_rewards: Diversity bonus for each sample (B * num_samples,)
+        """
+        if rl_coords is None or num_samples_per_image <= 1:
+            return torch.zeros(rl_coords.shape[0] if rl_coords is not None else 1, 
+                             device=rl_coords.device if rl_coords is not None else 'cpu')
+        
+        total_samples = rl_coords.shape[0]
+        num_images = total_samples // num_samples_per_image
+        num_points = rl_coords.shape[1]
+        device = rl_coords.device
+        
+        # Reshape to (num_images, num_samples_per_image, num_points, 2)
+        coords_per_image = rl_coords.view(num_images, num_samples_per_image, num_points, 2)
+        
+        diversity_rewards = []
+        
+        for img_idx in range(num_images):
+            # Get all samples for this image: (num_samples, num_points, 2)
+            img_coords = coords_per_image[img_idx]
+            
+            # Compute pairwise distances between samples
+            # Use mean of all attention points as the "center" of each sample
+            sample_centers = img_coords.mean(dim=1)  # (num_samples, 2)
+            
+            # Compute pairwise distances between sample centers
+            # distances[i, j] = ||center_i - center_j||
+            pairwise_dists = torch.cdist(sample_centers.unsqueeze(0), sample_centers.unsqueeze(0)).squeeze(0)
+            
+            # Get upper triangle (avoid counting pairs twice and self-distances)
+            mask = torch.triu(torch.ones_like(pairwise_dists), diagonal=1).bool()
+            valid_dists = pairwise_dists[mask]
+            
+            if len(valid_dists) > 0:
+                # Average distance, normalized by image size (256)
+                avg_dist = valid_dists.mean() / 256.0
+                # Scale to [0, 1] range (max theoretical distance is ~sqrt(2) ≈ 1.41 when normalized)
+                diversity_score = torch.clamp(avg_dist / 0.5, 0, 1)  # 0.5 is a reasonable target distance
+            else:
+                diversity_score = torch.tensor(0.0, device=device)
+            
+            # Same diversity reward for all samples from this image
+            for _ in range(num_samples_per_image):
+                diversity_rewards.append(diversity_score)
+        
+        return torch.stack(diversity_rewards).to(device)
+    
     def compute_prostate_boundary_penalty(
         self,
         rl_coords: torch.Tensor,
@@ -314,6 +383,7 @@ class RLRewardComputer:
         self,
         outputs: Dict[str, torch.Tensor],
         data: Dict[str, torch.Tensor],
+        num_samples_per_image: int = 1,
     ) -> torch.Tensor:
         """
         Compute rewards for a batch.
@@ -321,6 +391,7 @@ class RLRewardComputer:
         Args:
             outputs: Model outputs (data dict with 'cancer_logits' added)
             data: Original batch data
+            num_samples_per_image: Number of RL samples per image (for diversity reward)
             
         Returns:
             rewards: Rewards (B,)
@@ -352,6 +423,12 @@ class RLRewardComputer:
             prostate_mask = data['prostate_mask'].to(cancer_logits.device)
             boundary_penalty = self.compute_prostate_boundary_penalty(rl_coords, prostate_mask)
             rewards = rewards - boundary_penalty
+        
+        # Apply diversity reward if enabled (prevents policy collapse)
+        if self.diversity_reward_weight > 0 and 'rl_attention_coords' in outputs:
+            rl_coords = outputs['rl_attention_coords']
+            diversity_bonus = self.compute_diversity_reward(rl_coords, num_samples_per_image)
+            rewards = rewards + self.diversity_reward_weight * diversity_bonus
         
         # Normalize if requested (usually disabled for GRPO)
         if self.normalize_rewards and rewards.numel() > 1:
@@ -427,6 +504,9 @@ def build_rl_reward_computer(args) -> RLRewardComputer:
     heatmap_reward_weight = args.get('rl_heatmap_reward_weight', 0.5)
     classification_reward_weight = args.get('rl_classification_reward_weight', 0.5)
     
+    # Diversity reward (prevents policy collapse)
+    diversity_reward_weight = args.get('rl_diversity_reward_weight', 0.0)
+    
     return RLRewardComputer(
         reward_mode=reward_mode,
         cspca_bonus=cspca_bonus,
@@ -435,4 +515,5 @@ def build_rl_reward_computer(args) -> RLRewardComputer:
         prostate_boundary_penalty_scale=prostate_boundary_penalty_scale,
         heatmap_reward_weight=heatmap_reward_weight,
         classification_reward_weight=classification_reward_weight,
+        diversity_reward_weight=diversity_reward_weight,
     )

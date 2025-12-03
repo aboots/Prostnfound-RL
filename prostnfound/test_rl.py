@@ -41,10 +41,13 @@ from src.evaluator import CancerLogitsHeatmapsEvaluator as Evaluator
 @hydra.main(config_path="cfg", config_name="test_rl", version_base="1.3")
 def main(args):
 
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+
     os.makedirs(args.output_dir, exist_ok=True)
     
     if args.checkpoint:
-        state = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+        state = torch.load(args.checkpoint, map_location=device, weights_only=False)
     else: 
         state = None
 
@@ -57,7 +60,34 @@ def main(args):
     
     # Override test config with checkpoint's model config
     args.model = train_args.model
-    args.model_kw = train_args.model_kw
+    # Convert to plain dict to allow modification (OmegaConf struct mode blocks new keys)
+    model_kw = dict(train_args.model_kw)
+    
+    # Detect legacy checkpoints that don't have policy_arch_version
+    # Legacy checkpoints used a simpler attention_map_head architecture
+    if 'policy_arch_version' not in model_kw:
+        # Check if this is a legacy checkpoint by inspecting the state dict
+        has_legacy_arch = False
+        for key in state.get("model", {}).keys():
+            # Legacy architecture has attention_map_head.3.weight with shape [1, 256, 1, 1]
+            # New architecture has attention_map_head.3.weight with shape [128, 256, 3, 3]
+            if "attention_map_head.3.weight" in key:
+                weight_shape = state["model"][key].shape
+                if weight_shape == torch.Size([1, 256, 1, 1]):
+                    has_legacy_arch = True
+                    break
+        
+        if has_legacy_arch:
+            print("Detected legacy architecture checkpoint (v1). Setting policy_arch_version='v1'")
+            model_kw['policy_arch_version'] = 'v1'
+        else:
+            print("Architecture version not in checkpoint. Defaulting to 'v2'")
+            model_kw['policy_arch_version'] = 'v2'
+    
+    # Update args with the modified model_kw (use OmegaConf.update to handle struct mode)
+    OmegaConf.set_struct(args, False)  # Disable struct mode temporarily
+    args.model_kw = model_kw
+    OmegaConf.set_struct(args, True)  # Re-enable struct mode
 
     if args.save_checkpoint:
         torch.save(state, os.path.join(args.output_dir, "checkpoint.pth"))
@@ -84,7 +114,7 @@ def main(args):
     
     model = ProstNFoundMeta(base_model, is_rl=is_rl_model)
     print(model.load_state_dict(state["model"], strict=False))
-    model.to(args.device)
+    model.to(device)
     model.eval()
     if args.torch_compile:
         model = torch.compile(model)
@@ -133,7 +163,7 @@ def main(args):
         t0 = time.perf_counter()
 
         with torch.amp.autocast_mode.autocast(
-            device_type=torch.device(args.device).type, enabled=args.use_amp
+            device_type=device.type, enabled=args.use_amp
         ):
             with torch.inference_mode():
                 # Use deterministic policy for RL models
@@ -161,7 +191,7 @@ def main(args):
             heatmap = (heatmap * 255).astype(np.uint8)
             heatmap = Image.fromarray(heatmap)
 
-        if args.device == "cuda":
+        if device.type == "cuda":
             torch.cuda.synchronize()
         infer_time = time.perf_counter() - t0
         accumulator["infer_time"].append(infer_time)
@@ -262,8 +292,9 @@ def main(args):
             format=args.save_format,
         )
         plt.close()
-
-    evaluator(data)
+        
+        # Accumulate metrics for this batch
+        evaluator(data)
 
     table = evaluator.accumulator.compute()
     table.to_csv(os.path.join(args.output_dir, "metrics_by_core.csv"))

@@ -157,7 +157,10 @@ def main(cfg):
         num_samples_per_image = cfg.get('rl_num_samples_per_image', 4)
         logging.info(f"Using batched within-image comparison with {num_samples_per_image} samples per image")
         
-        # Create pure GRPO (no value function) like Seg-R1
+        # Check if using PPO mode (with value function)
+        use_value_function = cfg.model_kw.get('use_value_function', False)
+        
+        # Create GRPO (or PPO if value function is enabled)
         grpo = GRPO(
             clip_eps=cfg.get('rl_clip_eps', 0.2),
             entropy_coef=cfg.get('rl_entropy_coef', 0.01),
@@ -165,11 +168,16 @@ def main(cfg):
             max_grad_norm=cfg.get('rl_max_grad_norm', 0.5),
             normalize_advantages=cfg.get('rl_normalize_advantages', True),
             num_samples_per_image=num_samples_per_image,
+            use_value_function=use_value_function,
+            value_coef=cfg.get('rl_value_coef', 0.5),
         )
         
         reward_computer = build_rl_reward_computer(cfg)
         
-        logging.info(f"RL mode: Pure GRPO (no value function)")
+        if use_value_function:
+            logging.info(f"RL mode: PPO with value function (value_coef={cfg.get('rl_value_coef', 0.5)})")
+        else:
+            logging.info(f"RL mode: Pure GRPO (no value function)")
     else:
         grpo = None
         reward_computer = None
@@ -448,8 +456,8 @@ def run_rl_train_epoch_batched(
             old_log_probs = batched_outputs.get('rl_log_probs').detach()  # (B * num_samples, k)
             batched_coords = batched_outputs.get('rl_attention_coords')
             
-            # Compute rewards for all samples in one go
-            all_rewards = reward_computer(batched_outputs, batched_data)  # (B * num_samples,)
+            # Compute rewards for all samples in one go (pass num_samples for diversity reward)
+            all_rewards = reward_computer(batched_outputs, batched_data, num_samples_per_image=num_samples_per_image)  # (B * num_samples,)
         
         # Compute prostate boundary statistics for logging (use first sample per image)
         if args.get('rl_prostate_boundary_penalty_weight', 0) > 0:
@@ -472,16 +480,18 @@ def run_rl_train_epoch_batched(
                 # Batched forward for current policy (reuse replicated data)
                 current_outputs = model(batched_data, deterministic=False)
                 current_log_probs = current_outputs.get('rl_log_probs')  # (B * num_samples, k)
+                current_values = current_outputs.get('rl_value')  # (B * num_samples,) or None
                 
                 # Supervised loss (use mean over samples for stable training)
                 supervised_loss = criterion(current_outputs)
                 
-                # RL loss (pure GRPO without value function)
+                # RL loss (GRPO or PPO depending on whether value function is used)
                 rl_loss, rl_info = grpo.compute_loss(
                     current_log_probs,
                     old_log_probs,
                     all_rewards.detach(),
                     num_samples_per_image=num_samples_per_image,
+                    values=current_values,  # Pass values for PPO mode (None for GRPO)
                 )
                 
                 # Combined loss

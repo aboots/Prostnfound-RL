@@ -65,6 +65,15 @@ def calculate_metrics(predictions, labels, log_images=False):
     predictions = predictions[~nanvalues]
     labels = labels[~nanvalues]
 
+    if len(predictions) == 0:
+        logging.warning("All predictions were NaN or empty. Returning NaN metrics.")
+        return {
+            "core_auc": float("nan"),
+            "sensitivity": float("nan"),
+            "specificity": float("nan"),
+            "f1": float("nan"),
+        }
+
     from sklearn.metrics import (
         balanced_accuracy_score,
         f1_score,
@@ -78,6 +87,18 @@ def calculate_metrics(predictions, labels, log_images=False):
     # core predictions
     core_probs = predictions
     core_labels = labels
+    
+    # Check that we have both classes (required for AUC and other metrics)
+    unique_labels = np.unique(core_labels)
+    if len(unique_labels) < 2:
+        logging.warning(f"Only one class present in labels: {unique_labels}. Returning NaN metrics.")
+        return {
+            "core_auc": float("nan"),
+            "sensitivity": float("nan"),
+            "specificity": float("nan"),
+            "f1": float("nan"),
+        }
+    
     metrics["core_auc"] = roc_auc_score(core_labels, core_probs)
 
     # find the sensitivity at fixed specificities

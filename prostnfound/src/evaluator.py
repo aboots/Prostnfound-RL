@@ -10,9 +10,19 @@ from PIL import Image
 
 
 def _auc_roc(predictions, labels):
+    """Compute AUC-ROC with safety checks for empty or single-class data."""
     nanvalues = np.isnan(predictions)
     predictions = predictions[~nanvalues]
     labels = labels[~nanvalues]
+    
+    # Check for empty arrays or single class
+    if len(predictions) == 0 or len(labels) == 0:
+        return float('nan')
+    
+    unique_labels = np.unique(labels)
+    if len(unique_labels) < 2:
+        return float('nan')
+    
     return roc_auc_score(labels, predictions)
 
 
@@ -199,7 +209,7 @@ class CancerLogitsHeatmapsEvaluator:
         metrics_ = calculate_metrics(predictions, labels, log_images=self.log_images)
         metrics.update(metrics_)
 
-        metrics["topk_probs_auroc"] = _auc_roc(results_table.topk_score, labels)
+        metrics["topk_probs_auroc"] = _auc_roc(results_table.topk_score.values, labels)
         metrics["avg_bag_entropy"] = results_table["entropy"].mean()
 
         # prop pred err
