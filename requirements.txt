@@ -1,0 +1,48 @@
+## Core PyTorch stack
+torch
+torchvision
+torchaudio
+
+## Core scientific Python
+numpy
+pandas
+scipy
+scikit-learn
+scikit-image
+h5py
+
+## Imaging / medical imaging
+SimpleITK
+opencv-python
+monai
+albumentations
+
+## Configuration and CLI utilities
+hydra-core
+omegaconf
+python-dotenv
+rich_argparse
+simple-parsing
+docstring_parser
+ml_collections
+
+## Deep learning utilities
+timm
+einops
+loralib
+dinov2
+segment_anything
+
+## Experiment management / logging
+wandb
+submitit
+tqdm
+coolname
+mat73
+
+## Visualization
+matplotlib
+seaborn
+Pillow
+
+

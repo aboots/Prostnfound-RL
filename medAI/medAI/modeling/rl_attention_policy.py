@@ -8,6 +8,8 @@ Key Features:
 - Categorical Policy: Samples from attention heatmap (original)
 - Patch-Based Policy: Outputs K patch regions instead of K points (NEW)
 - Prostate masking can be toggled on/off
+- Architecture versions: v1 (legacy) and v2 (deeper, current)
+- Optional value head for PPO training
 """
 
 import torch
@@ -23,6 +25,8 @@ class RLAttentionPolicy(nn.Module):
     Now supports:
     - Toggle for prostate mask constraint
     - Improved multi-scale feature processing
+    - Architecture version selection (v1=legacy, v2=deeper)
+    - Optional value function for PPO training
     
     Args:
         feature_dim: Dimension of input features from encoder (default: 256)
@@ -32,6 +36,8 @@ class RLAttentionPolicy(nn.Module):
         use_clinical_features: Whether to incorporate clinical data (default: True)
         temperature: Temperature for sampling coordinates (default: 1.0)
         use_prostate_mask_constraint: Whether to constrain sampling to prostate (default: True)
+        arch_version: Architecture version ("v1" for legacy, "v2" for deeper) (default: "v2")
+        use_value_function: Whether to include value head for PPO training (default: False)
     """
     
     def __init__(
@@ -43,6 +49,8 @@ class RLAttentionPolicy(nn.Module):
         use_clinical_features: bool = True,
         temperature: float = 1.0,
         use_prostate_mask_constraint: bool = True,
+        arch_version: str = "v2",
+        use_value_function: bool = False,
     ):
         super().__init__()
         
@@ -53,6 +61,8 @@ class RLAttentionPolicy(nn.Module):
         self.use_clinical_features = use_clinical_features
         self.temperature = temperature
         self.use_prostate_mask_constraint = use_prostate_mask_constraint
+        self.arch_version = arch_version
+        self.use_value_function = use_value_function
         
         # Multi-scale feature processing for better spatial understanding
         self.feature_processor = nn.Sequential(
@@ -64,16 +74,26 @@ class RLAttentionPolicy(nn.Module):
             nn.ReLU(inplace=True),
         )
         
-        # Attention map generator with residual connection
-        self.attention_map_head = nn.Sequential(
-            nn.Conv2d(hidden_dim, hidden_dim // 2, kernel_size=3, padding=1),
-            nn.BatchNorm2d(hidden_dim // 2),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_dim // 2, hidden_dim // 4, kernel_size=3, padding=1),
-            nn.BatchNorm2d(hidden_dim // 4),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_dim // 4, 1, kernel_size=1),
-        )
+        # Attention map generator - architecture depends on version
+        if arch_version == "v1":
+            # Legacy architecture (simpler, for old checkpoints)
+            self.attention_map_head = nn.Sequential(
+                nn.Conv2d(hidden_dim, hidden_dim // 2, kernel_size=3, padding=1),
+                nn.BatchNorm2d(hidden_dim // 2),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(hidden_dim // 2, 1, kernel_size=1),  # Direct to 1 channel
+            )
+        else:  # v2 (default, deeper)
+            # Deeper architecture with more layers
+            self.attention_map_head = nn.Sequential(
+                nn.Conv2d(hidden_dim, hidden_dim // 2, kernel_size=3, padding=1),
+                nn.BatchNorm2d(hidden_dim // 2),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(hidden_dim // 2, hidden_dim // 4, kernel_size=3, padding=1),
+                nn.BatchNorm2d(hidden_dim // 4),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(hidden_dim // 4, 1, kernel_size=1),
+            )
         
         # Clinical feature embedding (optional)
         if use_clinical_features:
@@ -85,6 +105,16 @@ class RLAttentionPolicy(nn.Module):
             self.clinical_modulation = nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim),
                 nn.Sigmoid(),
+            )
+        
+        # Value function head for PPO (optional)
+        if use_value_function:
+            self.value_head = nn.Sequential(
+                nn.AdaptiveAvgPool2d((4, 4)),
+                nn.Flatten(),
+                nn.Linear(hidden_dim * 16, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(hidden_dim, 1),
             )
         
     def forward(
@@ -108,7 +138,7 @@ class RLAttentionPolicy(nn.Module):
             coords: Point coordinates in image space (B, k, 2) in range [0, image_size]
             log_probs: Log probabilities of selected points (B, k)
             attention_map: Raw attention heatmap (B, 1, H, W)
-            value: None (value function removed)
+            value: Value estimate if use_value_function=True, else None
         """
         B, C, H, W = image_features.shape
         
@@ -122,6 +152,11 @@ class RLAttentionPolicy(nn.Module):
             modulation = modulation[:, :, None, None]  # B x hidden_dim x 1 x 1
             features = features * modulation
         
+        # Compute value estimate if using value function (for PPO)
+        value = None
+        if self.use_value_function:
+            value = self.value_head(features).squeeze(-1)  # B
+        
         # Generate attention map (B x 1 x H x W)
         attention_map = self.attention_map_head(features)
         
@@ -130,6 +165,11 @@ class RLAttentionPolicy(nn.Module):
         
         # Apply temperature
         attention_logits = attention_logits / self.temperature
+        
+        # CRITICAL: Clamp logits to prevent numerical instability in softmax
+        # As training progresses, logits can grow very large causing NaN/underflow
+        # This is especially important with AMP (float16)
+        attention_logits = torch.clamp(attention_logits, min=-50.0, max=50.0)
         
         # Apply prostate mask constraint if enabled
         if self.use_prostate_mask_constraint and prostate_mask is not None:
@@ -152,28 +192,46 @@ class RLAttentionPolicy(nn.Module):
         
         # Sample or select top-k points
         if deterministic:
+            # Handle all-masked case: if all logits are -inf, use uniform fallback
+            all_inf_mask = (attention_logits == float('-inf')).all(dim=1)
+            if all_inf_mask.any():
+                # Replace with uniform for samples that are completely masked
+                attention_logits = attention_logits.clone()
+                uniform_logit = 0.0  # All equal logits → uniform distribution
+                attention_logits[all_inf_mask] = uniform_logit
+            
             # Select top-k points
             top_k_indices = torch.topk(attention_logits, k=self.num_attention_points, dim=1).indices
             coords_flat = top_k_indices  # B x k
             
-            # Compute log probs for selected points
-            log_probs = F.log_softmax(attention_logits, dim=1)
+            # Compute log probs for selected points (handle -inf gracefully)
+            # Replace -inf with a very small finite value for log_softmax stability
+            safe_logits = attention_logits.clone()
+            safe_logits = torch.where(
+                safe_logits == float('-inf'),
+                torch.full_like(safe_logits, -100.0),
+                safe_logits
+            )
+            log_probs = F.log_softmax(safe_logits, dim=1)
             selected_log_probs = torch.gather(log_probs, 1, coords_flat)  # B x k
         else:
             # Sample from categorical distribution
-            attention_probs = F.softmax(attention_logits, dim=1)
+            # Use log-softmax for numerical stability, then exponentiate
+            log_probs_all = F.log_softmax(attention_logits, dim=1)
+            attention_probs = log_probs_all.exp().clone()  # Clone to avoid in-place modification issues
             
-            # Handle NaN and invalid probability rows
-            for batch_idx in range(B):
-                row = attention_probs[batch_idx]
-                if torch.isnan(row).any() or row.sum() < 1e-6:
-                    attention_probs[batch_idx] = torch.ones_like(row) / row.size(0)
+            # Handle any remaining NaN/invalid rows (should be rare after logit clamping)
+            invalid_rows = torch.isnan(attention_probs).any(dim=1) | (attention_probs.sum(dim=1) < 1e-6)
+            if invalid_rows.any():
+                uniform_probs = torch.ones_like(attention_probs[0]) / attention_probs.shape[1]
+                attention_probs[invalid_rows] = uniform_probs
             
             # Sample k points without replacement
             sampled_indices_list = []
             log_probs_list = []
             
             for i in range(self.num_attention_points):
+                # Ensure valid probability distribution
                 attention_probs = torch.clamp(attention_probs, min=1e-8)
                 attention_probs = attention_probs / attention_probs.sum(dim=1, keepdim=True)
                 
@@ -184,7 +242,7 @@ class RLAttentionPolicy(nn.Module):
                 sampled_indices_list.append(sampled_idx)
                 log_probs_list.append(sampled_log_prob)
                 
-                # Zero out sampled points
+                # Zero out sampled points (scatter creates new tensor, no in-place issues)
                 attention_probs = attention_probs.scatter(1, sampled_idx.unsqueeze(1), 1e-8)
                 attention_probs = attention_probs / attention_probs.sum(dim=1, keepdim=True)
             
@@ -205,7 +263,7 @@ class RLAttentionPolicy(nn.Module):
         # Stack to (B, k, 2) format [x, y] as SAM expects
         coords = torch.stack([coords_x, coords_y], dim=2)  # B x k x 2
         
-        return coords, selected_log_probs, attention_map, None
+        return coords, selected_log_probs, attention_map, value
     
     def get_attention_map(self, image_features: torch.Tensor) -> torch.Tensor:
         """Get the raw attention map without sampling points."""
@@ -236,6 +294,7 @@ class RLPatchPolicy(nn.Module):
         max_patch_size: Maximum patch size as fraction of image (default: 0.3)
         use_clinical_features: Whether to use clinical data (default: True)
         use_prostate_mask_constraint: Whether to constrain patches to prostate (default: True)
+        use_value_function: Whether to include value head for PPO training (default: False)
     """
     
     def __init__(
@@ -249,6 +308,7 @@ class RLPatchPolicy(nn.Module):
         max_patch_size: float = 0.3,
         use_clinical_features: bool = True,
         use_prostate_mask_constraint: bool = True,
+        use_value_function: bool = False,
     ):
         super().__init__()
         
@@ -261,6 +321,7 @@ class RLPatchPolicy(nn.Module):
         self.max_patch_size = max_patch_size
         self.use_clinical_features = use_clinical_features
         self.use_prostate_mask_constraint = use_prostate_mask_constraint
+        self.use_value_function = use_value_function
         
         # Feature aggregation with attention pooling
         self.feature_processor = nn.Sequential(
@@ -305,6 +366,14 @@ class RLPatchPolicy(nn.Module):
             nn.Linear(hidden_dim // 2, num_patches * 4),
         )
         
+        # Value function head for PPO (optional)
+        if use_value_function:
+            self.value_head = nn.Sequential(
+                nn.Linear(flatten_dim, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(hidden_dim, 1),
+            )
+        
     def forward(
         self,
         image_features: torch.Tensor,
@@ -325,7 +394,7 @@ class RLPatchPolicy(nn.Module):
             coords: Point coordinates sampled from patches (B, k*points_per_patch, 2)
             log_probs: Log probabilities of patch predictions (B, k)
             patches: Patch parameters (B, k, 4) as (cx, cy, w, h) normalized [0, 1]
-            value: None (no value function)
+            value: Value estimate if use_value_function=True, else None
         """
         B, C, H, W = image_features.shape
         
@@ -340,6 +409,11 @@ class RLPatchPolicy(nn.Module):
         if self.use_clinical_features and clinical_features is not None:
             clinical_emb = self.clinical_embedder(clinical_features)  # B x 128
             pooled = torch.cat([pooled, clinical_emb], dim=1)
+        
+        # Compute value estimate if using value function (for PPO)
+        value = None
+        if self.use_value_function:
+            value = self.value_head(pooled).squeeze(-1)  # B
         
         # Predict patch parameters (mean)
         patch_mean = self.patch_head(pooled)  # B x (num_patches * 4)
@@ -377,7 +451,7 @@ class RLPatchPolicy(nn.Module):
         # Sample points from each patch
         coords = self._sample_points_from_patches(patches, prostate_mask)
         
-        return coords, log_probs, patches, None
+        return coords, log_probs, patches, value
     
     def _sample_points_from_patches(
         self,
@@ -397,6 +471,22 @@ class RLPatchPolicy(nn.Module):
         B, K, _ = patches.shape
         device = patches.device
         
+        # Prepare prostate mask if constraint is enabled
+        mask_tensor = None
+        if self.use_prostate_mask_constraint and prostate_mask is not None:
+            # Resize mask to image_size if needed
+            B_mask, C_mask, H_mask, W_mask = prostate_mask.shape
+            if H_mask != self.image_size or W_mask != self.image_size:
+                mask_tensor = F.interpolate(
+                    prostate_mask.float(),
+                    size=(self.image_size, self.image_size),
+                    mode='nearest'
+                )  # B x 1 x image_size x image_size
+            else:
+                mask_tensor = prostate_mask.float()
+            # Remove channel dimension: B x image_size x image_size
+            mask_tensor = mask_tensor.squeeze(1)
+        
         all_points = []
         
         for b in range(B):
@@ -405,8 +495,12 @@ class RLPatchPolicy(nn.Module):
                 cx, cy, w, h = patches[b, k]
                 
                 # Sample points uniformly within the patch
-                # Use a grid-like pattern for determinism in sampling
-                for i in range(self.points_per_patch):
+                # Use rejection sampling if prostate mask constraint is enabled
+                points_sampled = 0
+                max_attempts = self.points_per_patch * 20  # Safety limit
+                attempts = 0
+                
+                while points_sampled < self.points_per_patch and attempts < max_attempts:
                     # Sample relative positions within patch [-0.5, 0.5]
                     dx = (torch.rand(1, device=device) - 0.5) * w
                     dy = (torch.rand(1, device=device) - 0.5) * h
@@ -415,10 +509,36 @@ class RLPatchPolicy(nn.Module):
                     py = (cy + dy) * self.image_size
                     
                     # Clamp to valid range
+                    px = torch.clamp(px, 0, self.image_size - 1).squeeze()
+                    py = torch.clamp(py, 0, self.image_size - 1).squeeze()
+                    
+                    # Check if point is within prostate mask (if constraint enabled)
+                    if mask_tensor is not None:
+                        ix = int(px.item())
+                        iy = int(py.item())
+                        # Ensure indices are within bounds
+                        ix = min(max(0, ix), self.image_size - 1)
+                        iy = min(max(0, iy), self.image_size - 1)
+                        
+                        # Check if this pixel is inside prostate
+                        if mask_tensor[b, iy, ix] < 0.5:
+                            attempts += 1
+                            continue  # Reject this point, try again
+                    
+                    # Accept this point
+                    batch_points.append(torch.stack([px, py]))
+                    points_sampled += 1
+                    attempts += 1
+                
+                # If we couldn't sample enough points (e.g., patch is outside prostate),
+                # fall back to patch center
+                while points_sampled < self.points_per_patch:
+                    px = cx * self.image_size
+                    py = cy * self.image_size
                     px = torch.clamp(px, 0, self.image_size - 1)
                     py = torch.clamp(py, 0, self.image_size - 1)
-                    
-                    batch_points.append(torch.cat([px, py]))
+                    batch_points.append(torch.stack([px, py]))
+                    points_sampled += 1
             
             batch_points = torch.stack(batch_points)  # (k * points_per_patch, 2)
             all_points.append(batch_points)

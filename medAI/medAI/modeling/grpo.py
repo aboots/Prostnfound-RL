@@ -32,12 +32,18 @@ import logging
 
 class GRPO:
     """
-    Group Relative Policy Optimization (Pure GRPO without Value Function).
+    Group Relative Policy Optimization with optional PPO-style Value Function.
     
-    Following the Seg-R1 and DeepSeekMath approach:
-    - No value function (simpler and often works better)
-    - Advantages computed as: (reward - group_mean) / (group_std + eps)
-    - Within-image comparison: advantages normalized per image, not batch
+    Two modes of operation:
+    1. Pure GRPO (default, use_value_function=False):
+       - Following Seg-R1 and DeepSeekMath approach
+       - Advantages computed as: (reward - group_mean) / (group_std + eps)
+       - Within-image comparison: advantages normalized per image, not batch
+       
+    2. PPO mode (use_value_function=True):
+       - Uses value function for advantage estimation (GAE)
+       - More stable but requires value head in policy network
+       - Better for complex reward landscapes
     
     Args:
         clip_eps: Clipping epsilon for PPO-style clipping (default: 0.2)
@@ -46,6 +52,9 @@ class GRPO:
         kl_coef: Coefficient for KL penalty (like Seg-R1's beta, default: 0.01)
         normalize_advantages: Whether to normalize advantages (default: True)
         num_samples_per_image: Number of rollouts per image for within-image comparison (default: 4)
+        use_value_function: Whether to use value function for PPO (default: False)
+        value_coef: Coefficient for value loss when using PPO (default: 0.5)
+        gamma: Discount factor for GAE (default: 1.0, single-step so not used)
     """
     
     def __init__(
@@ -56,9 +65,9 @@ class GRPO:
         kl_coef: float = 0.01,
         normalize_advantages: bool = True,
         num_samples_per_image: int = 4,
-        # Legacy parameters (ignored)
-        value_coef: float = 0.0,  # Ignored - no value function
-        gamma: float = 1.0,  # Ignored - single step
+        use_value_function: bool = False,
+        value_coef: float = 0.5,
+        gamma: float = 1.0,
     ):
         self.clip_eps = clip_eps
         self.entropy_coef = entropy_coef
@@ -66,34 +75,61 @@ class GRPO:
         self.kl_coef = kl_coef
         self.normalize_advantages = normalize_advantages
         self.num_samples_per_image = num_samples_per_image
+        self.use_value_function = use_value_function
+        self.value_coef = value_coef
+        self.gamma = gamma
         
+        mode = "PPO with value function" if use_value_function else "Pure GRPO (no value function)"
         logging.info(
-            f"Initialized Pure GRPO (no value function) with clip_eps={clip_eps}, "
+            f"Initialized {mode} with clip_eps={clip_eps}, "
             f"entropy_coef={entropy_coef}, kl_coef={kl_coef}, "
             f"num_samples_per_image={num_samples_per_image}"
         )
+        if use_value_function:
+            logging.info(f"Value function enabled: value_coef={value_coef}")
     
     def compute_advantages(
         self,
         rewards: torch.Tensor,
         num_samples_per_image: Optional[int] = None,
-    ) -> torch.Tensor:
+        values: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
-        Compute advantages using group mean/std (no value function).
+        Compute advantages using either GRPO (group normalization) or PPO (value baseline).
         
-        This follows Seg-R1/DeepSeekMath approach:
-        advantages = (reward - group_mean) / (group_std + eps)
+        Pure GRPO (no value function):
+        - advantages = (reward - group_mean) / (group_std + eps)
+        - Within-image comparison normalized per image
         
-        For within-image comparison, we normalize within each image group.
+        PPO mode (with value function):
+        - advantages = rewards - values  (single-step, no GAE needed)
+        - returns = rewards (for value loss)
         
         Args:
             rewards: Rewards for each sample (B * num_samples,)
             num_samples_per_image: Number of samples per image
+            values: Optional value estimates (B * num_samples,) for PPO mode
             
         Returns:
             advantages: Computed advantages (B * num_samples,)
+            returns: Target returns for value loss (only if use_value_function=True)
         """
         num_samples = num_samples_per_image if num_samples_per_image is not None else self.num_samples_per_image
+        
+        # PPO mode: use value baseline
+        if self.use_value_function and values is not None:
+            # Single-step advantage: A = R - V
+            advantages = rewards - values.detach()
+            returns = rewards.clone()  # Target for value function
+            
+            # Optionally normalize advantages
+            if self.normalize_advantages:
+                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-4)
+            
+            return advantages, returns
+        
+        # Pure GRPO mode: group normalization
+        returns = None  # No value loss in GRPO mode
         
         if num_samples > 1 and self.normalize_advantages:
             total_samples = rewards.shape[0]
@@ -125,7 +161,7 @@ class GRPO:
         else:
             advantages = rewards
         
-        return advantages
+        return advantages, returns
     
     def compute_policy_loss(
         self,
@@ -149,8 +185,13 @@ class GRPO:
         log_probs_sum = log_probs.sum(dim=1)  # B
         old_log_probs_sum = old_log_probs.sum(dim=1)  # B
         
-        # Compute ratio
-        ratio = torch.exp(log_probs_sum - old_log_probs_sum)  # B
+        # NUMERICAL STABILITY: Clamp log ratio to prevent exp() overflow
+        # This is critical for preventing NaN after several epochs
+        log_ratio = log_probs_sum - old_log_probs_sum
+        log_ratio = torch.clamp(log_ratio, min=-20.0, max=20.0)  # exp(20) ≈ 485M, exp(-20) ≈ 0
+        
+        # Compute ratio with clamped log_ratio
+        ratio = torch.exp(log_ratio)  # B
         
         # Clipped surrogate objective
         advantages = advantages.detach()  # Don't backprop through advantages
@@ -170,14 +211,26 @@ class GRPO:
         # Total loss (with KL penalty like Seg-R1)
         total_loss = policy_loss + self.kl_coef * kl - self.entropy_coef * entropy
         
+        # Check for NaN/Inf and handle gracefully
+        if torch.isnan(total_loss) or torch.isinf(total_loss):
+            logging.warning(
+                f"NaN/Inf detected in GRPO loss! "
+                f"ratio_range=[{ratio.min().item():.2f}, {ratio.max().item():.2f}], "
+                f"log_ratio_range=[{log_ratio.min().item():.2f}, {log_ratio.max().item():.2f}], "
+                f"advantages_std={advantages.std().item():.4f}"
+            )
+            # Return zero loss to skip this batch gracefully
+            total_loss = torch.zeros_like(total_loss)
+        
         # Logging info
         info = {
-            'policy_loss': policy_loss.item(),
-            'kl': kl.item(),
-            'entropy': entropy.item(),
+            'policy_loss': policy_loss.item() if not torch.isnan(policy_loss) else 0.0,
+            'kl': kl.item() if not torch.isnan(kl) else 0.0,
+            'entropy': entropy.item() if not torch.isnan(entropy) else 0.0,
             'ratio_mean': ratio.mean().item(),
             'ratio_min': ratio.min().item(),
             'ratio_max': ratio.max().item(),
+            'log_ratio_max': log_ratio.abs().max().item(),  # Track for debugging
             'advantages_mean': advantages.mean().item(),
             'advantages_std': advantages.std().item(),
         }
@@ -190,27 +243,39 @@ class GRPO:
         old_log_probs: torch.Tensor,
         rewards: torch.Tensor,
         num_samples_per_image: Optional[int] = None,
-        values: Optional[torch.Tensor] = None,  # Ignored for backward compatibility
+        values: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
-        Compute total GRPO loss (pure GRPO without value function).
+        Compute total loss (GRPO or PPO depending on configuration).
         
         Args:
             log_probs: Current log probabilities (B * num_samples, k)
             old_log_probs: Old log probabilities (B * num_samples, k)
             rewards: Rewards (B * num_samples,)
             num_samples_per_image: Number of samples per image for within-image normalization
-            values: Ignored (kept for backward compatibility)
+            values: Value estimates (B * num_samples,) - used only if use_value_function=True
             
         Returns:
-            total_loss: Policy loss
+            total_loss: Combined policy and value loss
             info: Dictionary with loss components
         """
-        # Compute advantages with within-image normalization (no value function)
-        advantages = self.compute_advantages(rewards, num_samples_per_image=num_samples_per_image)
+        # Compute advantages (with or without value baseline)
+        advantages, returns = self.compute_advantages(
+            rewards, 
+            num_samples_per_image=num_samples_per_image,
+            values=values,
+        )
         
         # Compute policy loss
-        total_loss, info = self.compute_policy_loss(log_probs, old_log_probs, advantages)
+        policy_loss, info = self.compute_policy_loss(log_probs, old_log_probs, advantages)
+        total_loss = policy_loss
+        
+        # Add value loss if using PPO mode
+        if self.use_value_function and values is not None and returns is not None:
+            value_loss = F.mse_loss(values, returns)
+            total_loss = total_loss + self.value_coef * value_loss
+            info['value_loss'] = value_loss.item()
+        
         info['total_loss'] = total_loss.item()
         
         # Add within-image comparison info

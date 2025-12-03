@@ -152,7 +152,8 @@ def _build_sam(
                 )
                 print(checkpoint.name, " is downloaded!")
         with open(checkpoint, "rb") as f:
-            state_dict = torch.load(f)
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            state_dict = torch.load(f, map_location=device)
         print(
             f"Loaded sam state with message {sam.load_state_dict(state_dict, strict=load_strict)}"
         )

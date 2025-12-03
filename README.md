@@ -332,6 +332,20 @@ The codebase also supports the OPTIMUM dataset with different preprocessing. Set
 
 ### Step-by-Step Installation
 
+#### Option A (Recommended): Conda environment
+
+```bash
+# 1. Clone the repository
+git clone https://github.com/yourusername/prostnfound.git
+cd prostnfound
+
+# 2. Create conda environment (name is "prostnfound" by default)
+conda env create -f environment.yml
+conda activate prostnfound  # or your preferred env name
+```
+
+#### Option B: Pure pip / virtualenv
+
 ```bash
 # 1. Clone the repository
 git clone https://github.com/yourusername/prostnfound.git
@@ -342,23 +356,20 @@ python -m venv venv
 source venv/bin/activate  # Linux/Mac
 # or: venv\Scripts\activate  # Windows
 
-# 3. Install PyTorch (adjust for your CUDA version)
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+# 3. Install all Python dependencies
+pip install -r requirements.txt
 
-# 4. Install medAI package
-cd medAI
-pip install -e .
-cd ..
+# 4. Install local packages in editable mode
+pip install -e medAI
+pip install -e external_libs
 
-# 5. Install external libraries
-cd external_libs
-pip install -e .
-cd ..
+# 5. (Optional) If you prefer manual setup, you can still follow:
+#    - Install PyTorch for your CUDA version
+#    - pip install -e medAI
+#    - pip install -e external_libs
+#    - pip install -r external_libs/external_libs/requirements.txt
 
-# 6. Install additional requirements
-pip install -r external_libs/external_libs/requirements.txt
-
-# 7. Download MedSAM checkpoint
+# 6. Download MedSAM checkpoint
 mkdir -p checkpoints
 wget -O checkpoints/medsam_vit_b_cpu.pth "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth"
 # Note: You may need to obtain the actual MedSAM weights from the original authors

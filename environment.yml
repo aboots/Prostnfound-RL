@@ -1,0 +1,67 @@
+name: prostnfound
+
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  # Core tooling
+  - python=3.10
+  - pip
+
+  # Core scientific Python
+  - numpy
+  - pandas
+  - scipy
+  - scikit-learn
+  - scikit-image
+  - h5py
+
+  # Imaging / medical imaging
+  - simpleitk
+  - opencv
+
+  # Visualization and utilities
+  - matplotlib
+  - seaborn
+  - pillow
+  - tqdm
+
+  # Everything else via pip (including local editable packages)
+  - pip:
+      # PyTorch stack (adjust version/CUDA build as needed)
+      - torch
+      - torchvision
+      - torchaudio
+
+      # Config / CLI
+      - hydra-core
+      - omegaconf
+      - python-dotenv
+      - rich_argparse
+      - simple-parsing
+      - docstring_parser
+      - ml_collections
+
+      # Deep learning utilities
+      - timm
+      - einops
+      - loralib
+      - dinov2
+      - segment_anything
+      - monai
+      - albumentations
+
+      # Experiment management / logging
+      - wandb
+      - submitit
+      - coolname
+      - mat73
+
+      # Local packages (installed in editable mode; run from repo root)
+      - -e ./medAI
+      - -e ./external_libs
+
+
